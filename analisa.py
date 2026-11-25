@@ -8,6 +8,8 @@ MODAL = 10_000_000   # angka awal di kotak modal (bisa diganti langsung di halam
 RISIKO = 1           # angka awal maksimal rugi per transaksi, % dari modal
 MIN_LIKUID = 5       # minimal nilai transaksi harian, miliar rupiah
 JUMLAH_TOP = 5       # berapa saham yang ditampilin di bagian "layak beli"
+MACD_MIN_SKOR = 50   # MACD ditampilin buat saham yang skornya di atas angka ini
+MACD_BARU = 3        # cross disebut "baru" kalau terjadi dalam sekian hari bursa terakhir
 BIAYA = 0.002        # perkiraan fee + selisih harga tiap transaksi (0,2%)
 STOP_ATR = 2         # stop loss = harga - 2x gerak harian rata-rata
 TARGET_ATR = 3       # target    = harga + 3x gerak harian rata-rata
@@ -15,6 +17,7 @@ VOLUME_RAMAI = 1.5   # volume disebut ramai kalau 1,5x rata-rata 20 hari
 # =============================================================
 
 LABEL = ["🟢 Layak beli", "🟡 Pantau / cicil", "⚪ Tunggu", "🔴 Hindari dulu", "⚫ Kurang likuid"]
+TEKS_MACD = {"baru-naik": "▲ Baru naik", "naik": "▲ Naik", "baru-turun": "▼ Baru turun", "turun": "▼ Turun"}
 
 # ---------- AMBIL DATA ----------
 def ambil_harga(kode):
@@ -82,6 +85,19 @@ def info_volume(df):
     akumulasi = bool(obv.iloc[-1] > obv.rolling(20).mean().iloc[-1])
     nilai_harian = float((c * v).rolling(20).mean().iloc[-1])
     return rasio, akumulasi, nilai_harian
+
+def info_macd(c):
+    """MACD standar 12/26/9."""
+    garis = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
+    sinyal = garis.ewm(span=9, adjust=False).mean()
+    hist = garis - sinyal
+    di_atas = hist > 0
+    ganti = np.flatnonzero((di_atas != di_atas.shift(1)).to_numpy())
+    hari = len(hist) - 1 - int(ganti[-1]) if len(ganti) else 999
+    naik = bool(di_atas.iloc[-1])
+    status = ("baru-" if hari <= MACD_BARU else "") + ("naik" if naik else "turun")
+    return {"garis": garis, "sinyal": sinyal, "hist": hist, "status": status, "hari": hari,
+            "menguat": bool(hist.iloc[-1] > hist.iloc[-2]), "atas_nol": bool(garis.iloc[-1] > 0)}
 
 # ---------- STRATEGI YANG DIUJI ----------
 def posisi_dari_sinyal(masuk, keluar):
@@ -200,7 +216,8 @@ def proses(kode, ihsg):
             "rekom": label(akhir) if likuid else LABEL[4],
             "posisi": int(m["pos"].iloc[-1]), "harga": harga, "stop": stop, "target": target,
             "lot": hitung_lot(harga, stop), "rasio": rasio, "akumulasi": akumulasi,
-            "nilai_harian": nilai_harian, "likuid": likuid}
+            "nilai_harian": nilai_harian, "likuid": likuid,
+            "macd": info_macd(df["Close"]), "pakai_macd": round(akhir) > MACD_MIN_SKOR}
 
 def cari_perubahan(hasil, pembanding):
     out = []
@@ -253,6 +270,25 @@ def bikin_grafik(d, pertama):
     return fig.to_html(full_html=False, include_plotlyjs="cdn" if pertama else False,
                        config={"responsive": True, "displayModeBar": False})
 
+def bikin_grafik_macd(d):
+    mc = d["macd"]
+    hist = mc["hist"].iloc[-500:]
+    warna = ["#2e9e4f" if v >= 0 else "#d64545" for v in hist]
+    fig = go.Figure()
+    fig.add_bar(x=hist.index, y=hist, name="Histogram", marker_color=warna)
+    fig.add_scatter(x=hist.index, y=mc["garis"].reindex(hist.index), name="MACD", line=dict(color="#0b5cad"))
+    fig.add_scatter(x=hist.index, y=mc["sinyal"].reindex(hist.index), name="Sinyal", line=dict(color="#e08a00"))
+    fig.update_layout(height=240, margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h"))
+    return fig.to_html(full_html=False, include_plotlyjs=False,
+                       config={"responsive": True, "displayModeBar": False})
+
+def teks_macd_panjang(mc):
+    arah = TEKS_MACD[mc["status"]]
+    sejak = "hari ini" if mc["hari"] == 0 else f"{mc['hari']} hari bursa lalu"
+    tenaga = "membesar (dorongan menguat)" if mc["menguat"] else "mengecil (dorongan melemah)"
+    nol = "di atas garis nol (tren menengah naik)" if mc["atas_nol"] else "di bawah garis nol (tren menengah masih turun)"
+    return f"MACD: <b>{arah}</b>, cross terakhir {sejak}. Histogram {tenaga}. Garis MACD {nol}."
+
 def blok_detail(d, pertama, ihsg):
     m, f = d["m"], d["f"]
     harga, stop, target = d["harga"], d["stop"], d["target"]
@@ -266,9 +302,12 @@ def blok_detail(d, pertama, ihsg):
     target_pct = (target / harga - 1) * 100
     atribut = data_lot(d)
     grafik = bikin_grafik(d, pertama)
+    grafik_macd = bikin_grafik_macd(d) if d["pakai_macd"] else ""
+    baris_macd = "<li>" + teks_macd_panjang(d["macd"]) + "</li>" if d["pakai_macd"] else ""
     return f"""<details class="blok" id="{d['kode']}">
 <summary><b>{d['kode']}</b> {e(f['nama'])} · {d['rekom']} · skor {d['akhir']:.0f}</summary>
 {grafik}
+{grafik_macd}
 <p class="info">Sektor: {e(f['sektor'])}</p>
 <p><b>Rencana transaksi</b> (kalau masuk di harga sekarang)</p>
 <ul>
@@ -279,6 +318,7 @@ def blok_detail(d, pertama, ihsg):
 <ul>
 <li>Strategi paling cocok: <b>{e(m['nama'])}</b>, posisi sekarang <b>{posisi}</b></li>
 <li>Ujian sejak {m['mulai_uji']:%b %Y} (kanan garis abu-abu): strategi {m['ret_uji']*100:+.1f}% vs beli-diamkan {m['bh_uji']*100:+.1f}% → <b>{ujian}</b></li>
+{baris_macd}
 <li>Kondisi IHSG: {teks_ihsg}</li>
 <li>Volume terakhir {d['rasio']:.1f}x rata-rata 20 hari, arah {teks_vol}</li>
 <li>Nilai transaksi harian rata-rata {rp(d['nilai_harian'])} → {teks_likuid}</li>
@@ -308,7 +348,7 @@ h1{font-size:1.5rem;margin-bottom:0} h2{font-size:1.15rem;margin-top:32px;border
 .kartu small{color:#555}
 .geser{overflow-x:auto} table{border-collapse:collapse;width:100%;background:#fff;font-size:.9rem}
 th,td{padding:6px 10px;border-bottom:1px solid #e5e5e5;text-align:right;white-space:nowrap}
-th:first-child,td:first-child,th:nth-child(4),td:nth-child(4),th:last-child,td:last-child{text-align:left}
+th:first-child,td:first-child,th:nth-child(4),td:nth-child(4),th:nth-child(10),td:nth-child(10),th:last-child,td:last-child{text-align:left}
 th{background:#f0f0f0;cursor:pointer;user-select:none}
 details{background:#fff;border:1px solid #ddd;border-radius:8px;padding:10px 14px;margin:8px 0}
 summary{cursor:pointer} a{color:#0b5cad;text-decoration:none} footer{margin-top:32px;color:#777;font-size:.8rem}
@@ -325,15 +365,16 @@ window.addEventListener('hashchange',buka);buka();
 function ambilNilai(id){return document.getElementById(id).value;}
 function saring(){
   var cari=ambilNilai('f-cari').toUpperCase().split(/[ ,]+/).filter(function(k){return k;});
-  var rekom=ambilNilai('f-rekom'), sinyal=ambilNilai('f-sinyal'), sektor=ambilNilai('f-sektor');
+  var rekom=ambilNilai('f-rekom'), sinyal=ambilNilai('f-sinyal'), sektor=ambilNilai('f-sektor'), macd=ambilNilai('f-macd');
   var skor=parseFloat(ambilNilai('f-skor'))||0;
   var lulus=document.getElementById('f-lulus').checked, kebeli=document.getElementById('f-lot').checked;
   var tampil={}, n=0, semua=0;
   document.querySelectorAll('tr.baris').forEach(function(tr){
     semua++;
     var d=tr.dataset, lot=parseInt(tr.querySelector('[data-harga]').textContent)||0;
+    var okMacd=!macd||(macd.indexOf('baru')===0?d.macd===macd:d.macd.indexOf(macd)>=0);
     var ok=(cari.length===0||cari.some(function(k){return d.kode.indexOf(k)>=0;}))
-      &&(!rekom||d.rekom===rekom)&&(!sinyal||d.sinyal===sinyal)&&(!sektor||d.sektor===sektor)
+      &&(!rekom||d.rekom===rekom)&&(!sinyal||d.sinyal===sinyal)&&(!sektor||d.sektor===sektor)&&okMacd
       &&parseFloat(d.skor)>=skor&&(!lulus||d.lulus==='1')&&(!kebeli||lot>=1);
     tr.style.display=ok?'':'none'; tampil[d.kode]=ok; if(ok){n++;}
   });
@@ -341,9 +382,9 @@ function saring(){
   document.getElementById('f-jumlah').textContent='Menampilkan '+n+' dari '+semua+' saham';
 }
 ['f-cari','f-skor'].forEach(function(id){document.getElementById(id).addEventListener('input',saring);});
-['f-rekom','f-sinyal','f-sektor','f-lulus','f-lot'].forEach(function(id){document.getElementById(id).addEventListener('change',saring);});
+['f-rekom','f-sinyal','f-sektor','f-macd','f-lulus','f-lot'].forEach(function(id){document.getElementById(id).addEventListener('change',saring);});
 document.getElementById('f-reset').addEventListener('click',function(){
-  ['f-cari','f-rekom','f-sinyal','f-sektor'].forEach(function(id){document.getElementById(id).value='';});
+  ['f-cari','f-rekom','f-sinyal','f-sektor','f-macd'].forEach(function(id){document.getElementById(id).value='';});
   document.getElementById('f-skor').value='0';
   document.getElementById('f-lulus').checked=false; document.getElementById('f-lot').checked=false;
   saring();
@@ -401,6 +442,9 @@ def bikin_filter(hasil):
             f"<select id='f-rekom'><option value=''>Semua rekomendasi</option>{pilihan_rekom}</select>"
             "<select id='f-sinyal'><option value=''>Semua sinyal</option><option value='Beli'>Beli</option>"
             "<option value='Jual'>Jual</option></select>"
+            "<select id='f-macd'><option value=''>Semua MACD</option><option value='naik'>MACD naik</option>"
+            "<option value='baru-naik'>MACD baru naik</option><option value='turun'>MACD turun</option>"
+            "<option value='baru-turun'>MACD baru turun</option></select>"
             f"<select id='f-sektor'><option value=''>Semua sektor</option>{pilihan_sektor}</select>"
             "<label>Skor minimal <input id='f-skor' type='text' inputmode='numeric' value='0'></label>"
             "<label><input type='checkbox' id='f-lulus'> Cuma yang lulus ujian</label>"
@@ -439,11 +483,12 @@ def bikin_halaman(hasil, perubahan, tgl_pembanding, ihsg, gagal, tanggal_data):
     if top:
         b.append("<div class='kartu-wrap'>")
         for d in top:
+            macd_kartu = "<br>MACD " + TEKS_MACD[d["macd"]["status"]] if d["pakai_macd"] else ""
             b.append(f"<div class='kartu'><span class='skor'>{d['akhir']:.0f}</span>"
                      f"<div class='kode'><a href='#{d['kode']}'>{d['kode']}</a></div>"
                      f"<small>{e(d['f']['nama'])}</small><br>"
                      f"Harga {rp(d['harga'])}<br>Stop loss {rp(d['stop'])}<br>Target {rp(d['target'])}<br>"
-                     f"Maks <b><span {data_lot(d)}>{d['lot']}</span> lot</b></div>")
+                     f"Maks <b><span {data_lot(d)}>{d['lot']}</span> lot</b>{macd_kartu}</div>")
         b.append("</div>")
     else:
         b.append("<p>Hari ini gak ada saham yang skornya 70 ke atas. Gak beli apa-apa juga keputusan yang sah.</p>")
@@ -463,20 +508,23 @@ def bikin_halaman(hasil, perubahan, tgl_pembanding, ihsg, gagal, tanggal_data):
     # --- Peringkat + filter ---
     b.append("<h2>Peringkat lengkap</h2>")
     b.append(bikin_filter(hasil))
-    b.append("<p class='info'>Klik judul kolom buat ngurutin.</p>")
+    b.append(f"<p class='info'>Klik judul kolom buat ngurutin. Kolom MACD cuma keisi buat saham dengan skor di atas {MACD_MIN_SKOR}.</p>")
     b.append("<div class='geser'><table id='tabel-peringkat'><tr><th>Kode</th><th>Harga</th><th>Skor</th>"
              "<th>Rekomendasi</th><th>Sinyal</th><th>Stop loss</th><th>Target</th><th>Maks lot</th>"
-             "<th>Volume</th><th>Sektor</th></tr>")
+             "<th>Volume</th><th>MACD</th><th>Sektor</th></tr>")
     for d in hasil:
         sinyal = "Beli" if d["posisi"] == 1 else "Jual"
         lulus = "1" if d["m"]["lulus"] else "0"
         sektor = e(d["f"]["sektor"])
+        kode_macd = d["macd"]["status"] if d["pakai_macd"] else ""
+        teks_macd = TEKS_MACD[kode_macd] if kode_macd else "-"
         b.append(f"<tr class='baris' data-kode='{d['kode']}' data-skor='{d['akhir']:.0f}' data-rekom='{e(d['rekom'])}' "
-                 f"data-sinyal='{sinyal}' data-lulus='{lulus}' data-sektor='{sektor}'>"
+                 f"data-sinyal='{sinyal}' data-lulus='{lulus}' data-sektor='{sektor}' data-macd='{kode_macd}'>"
                  f"<td><a href='#{d['kode']}'><b>{d['kode']}</b></a></td><td>{angka(d['harga'])}</td>"
                  f"<td>{d['akhir']:.0f}</td><td>{d['rekom']}</td><td>{sinyal}</td>"
                  f"<td>{angka(d['stop'])}</td><td>{angka(d['target'])}</td>"
-                 f"<td {data_lot(d)}>{d['lot']}</td><td>{d['rasio']:.1f}x</td><td>{sektor}</td></tr>")
+                 f"<td {data_lot(d)}>{d['lot']}</td><td>{d['rasio']:.1f}x</td>"
+                 f"<td>{teks_macd}</td><td>{sektor}</td></tr>")
     b.append("</table></div>")
 
     # --- Detail ---
