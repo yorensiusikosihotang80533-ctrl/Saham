@@ -4,10 +4,11 @@ import numpy as np, pandas as pd
 import yfinance as yf
 
 # ================= PENGATURAN (boleh diubah) =================
+TUNGGU_HARI = 5    # berapa hari bursa nunggu harga nyentuh area beli sebelum dibatalkan
 MAKS_HARI = 20     # posisi ditutup paksa setelah sekian hari bursa
 BIAYA = 0.004      # total fee beli + jual (0,4%)
-STOP_ATR = 2       # samain dengan analisa.py
-TARGET_ATR = 3     # samain dengan analisa.py
+STOP_ATR = 2       # cadangan kalau analisa.py gak ngasih stop loss
+TARGET_ATR = 3     # cadangan kalau analisa.py gak ngasih target
 MIN_BERARTI = 30   # jumlah catatan selesai per kelompok sebelum angkanya layak dipercaya
 # =============================================================
 
@@ -16,7 +17,9 @@ URUTAN_REKOM = ["🟢 Layak beli", "🟡 Pantau / cicil", "⚪ Tunggu", "🔴 Hi
 RENTANG_SKOR = [(80, 101, "80 ke atas"), (70, 80, "70 sampai 79"), (60, 70, "60 sampai 69"),
                 (50, 60, "50 sampai 59"), (40, 50, "40 sampai 49"), (0, 40, "Di bawah 40")]
 NAMA_STATUS = {"target": "🎯 Kena target", "stop": "🛑 Kena stop loss", "waktu": "⏱ Waktu habis",
-               "berjalan": "Berjalan", "menunggu": "Menunggu masuk"}
+               "berjalan": "Berjalan", "menunggu": "Menunggu masuk", "batal": "Batal, gak nyentuh area beli"}
+SELESAI = ("target", "stop", "waktu")
+TERBUKA = ("menunggu", "berjalan")
 
 def ambil(simbol):
     for _ in range(3):
@@ -48,23 +51,45 @@ def banding_ihsg(ihsg, awal, akhir):
     return float(b / a - 1)
 
 def perbarui(r, df, ihsg):
-    """Cek apakah catatan ini sudah masuk, kena target, kena stop loss, atau habis waktu."""
+    """Cek apakah catatan ini sudah masuk, batal, kena target, kena stop loss, atau habis waktu."""
     sinyal = pd.Timestamp(r["tgl_sinyal"])
     sesudah = df[df.index > sinyal]
     if len(sesudah) == 0:
         return
-    masuk = float(sesudah["Open"].iloc[0])
+    batas_masuk = r.get("masuk")
+
+    # --- tentuin hari dan harga masuk ---
+    i_masuk, masuk = None, None
+    if batas_masuk is None:
+        i_masuk, masuk = 0, float(sesudah["Open"].iloc[0])        # aturan lama: masuk di pembukaan besoknya
+    else:
+        for i in range(min(len(sesudah), TUNGGU_HARI)):
+            b = sesudah.iloc[i]
+            if b["Open"] <= batas_masuk:
+                i_masuk, masuk = i, float(b["Open"])
+                break
+            if b["Low"] <= batas_masuk:
+                i_masuk, masuk = i, float(batas_masuk)
+                break
+        if i_masuk is None:
+            if len(sesudah) >= TUNGGU_HARI:
+                r["status"] = "batal"
+                r["tgl_keluar"] = sesudah.index[TUNGGU_HARI - 1].strftime("%Y-%m-%d")
+            return
     if masuk <= 0:
         return
+
     r["status"] = "berjalan"
-    r["tgl_masuk"] = sesudah.index[0].strftime("%Y-%m-%d")
+    r["tgl_masuk"] = sesudah.index[i_masuk].strftime("%Y-%m-%d")
     r["harga_masuk"] = masuk
-    for i, (tgl, b) in enumerate(sesudah.iterrows()):
+    pegang = sesudah.iloc[i_masuk:]
+    for i, (tgl, b) in enumerate(pegang.iterrows()):
         keluar, status = None, None
-        if b["Low"] <= r["stop"]:                       # kalau target dan stop kena di hari yang sama, dianggap stop
-            keluar, status = min(float(b["Open"]), float(r["stop"])), "stop"
-        elif b["High"] >= r["target"]:
-            keluar, status = max(float(b["Open"]), float(r["target"])), "target"
+        buka = masuk if i == 0 else float(b["Open"])
+        if b["Low"] <= r["stop"]:                           # kalau target dan stop kena di hari yang sama, dianggap stop
+            keluar, status = min(buka, float(r["stop"])), "stop"
+        elif i > 0 and b["High"] >= r["target"]:            # di hari masuk, target belum dihitung (urutan harga gak diketahui)
+            keluar, status = max(buka, float(r["target"])), "target"
         elif i + 1 >= MAKS_HARI:
             keluar, status = float(b["Close"]), "waktu"
         if keluar is not None:
@@ -73,11 +98,11 @@ def perbarui(r, df, ihsg):
             r["harga_keluar"] = keluar
             r["hari"] = i + 1
             r["hasil"] = keluar / masuk - 1 - BIAYA
-            r["ihsg"] = banding_ihsg(ihsg, sinyal, tgl)
+            r["ihsg"] = banding_ihsg(ihsg, pd.Timestamp(r["tgl_masuk"]), tgl)
             r.pop("hasil_sementara", None)
             return
-    r["hari"] = len(sesudah)
-    r["hasil_sementara"] = float(sesudah["Close"].iloc[-1]) / masuk - 1
+    r["hari"] = len(pegang)
+    r["hasil_sementara"] = float(pegang["Close"].iloc[-1]) / masuk - 1
 
 # ---------- BIKIN HALAMAN ----------
 def e(x):
@@ -92,21 +117,21 @@ def angka(x):
 def tgl_pendek(s):
     return datetime.strptime(s, "%Y-%m-%d").strftime("%d %b")
 
-def baris_ringkas(nama, rek):
+def baris_ringkas(nama, rek, batal):
     n = len(rek)
     if n == 0:
-        return f"<tr><td>{e(nama)}</td><td>0</td>" + "<td>-</td>" * 6 + "</tr>"
+        return f"<tr><td>{e(nama)}</td><td>0</td><td>{batal}</td>" + "<td>-</td>" * 6 + "</tr>"
     bagian = lambda st: f"{sum(1 for r in rek if r['status'] == st) / n * 100:.0f}%"
     rata = float(np.mean([r["hasil"] for r in rek]))
     ada = [r["ihsg"] for r in rek if r.get("ihsg") is not None]
     ihsg = float(np.mean(ada)) if ada else None
     selisih = None if ihsg is None else rata - ihsg
     jumlah = str(n) if n >= MIN_BERARTI else f"{n} ⚠️"
-    return (f"<tr><td>{e(nama)}</td><td>{jumlah}</td><td>{bagian('target')}</td><td>{bagian('stop')}</td>"
+    return (f"<tr><td>{e(nama)}</td><td>{jumlah}</td><td>{batal}</td><td>{bagian('target')}</td><td>{bagian('stop')}</td>"
             f"<td>{bagian('waktu')}</td><td><b>{pct(rata)}</b></td><td>{pct(ihsg)}</td><td><b>{pct(selisih)}</b></td></tr>")
 
-KEPALA_RINGKAS = ("<tr><th>{}</th><th>Selesai</th><th>Kena target</th><th>Kena stop loss</th><th>Waktu habis</th>"
-                  "<th>Rata-rata hasil</th><th>IHSG periode sama</th><th>Selisih</th></tr>")
+KEPALA_RINGKAS = ("<tr><th>{}</th><th>Selesai</th><th>Batal</th><th>Kena target</th><th>Kena stop loss</th>"
+                  "<th>Waktu habis</th><th>Rata-rata hasil</th><th>IHSG periode sama</th><th>Selisih</th></tr>")
 
 CSS = """
 body{font-family:system-ui,sans-serif;max-width:1000px;margin:0 auto;padding:16px;color:#1a1a1a;background:#fafafa;line-height:1.5}
@@ -120,7 +145,8 @@ a{color:#0b5cad;text-decoration:none} footer{margin-top:32px;color:#777;font-siz
 
 def bikin_halaman(rekam):
     wib = datetime.now(timezone(timedelta(hours=7)))
-    selesai = [r for r in rekam if r["status"] in ("target", "stop", "waktu")]
+    selesai = [r for r in rekam if r["status"] in SELESAI]
+    batal = [r for r in rekam if r["status"] == "batal"]
     jalan = [r for r in rekam if r["status"] == "berjalan"]
     tunggu = [r for r in rekam if r["status"] == "menunggu"]
     b = []
@@ -129,10 +155,11 @@ def bikin_halaman(rekam):
     b.append("<title>Rekam Jejak Rekomendasi</title><style>" + CSS + "</style></head><body>")
     b.append("<h1>📒 Rekam Jejak Rekomendasi</h1>")
     b.append("<p><a href='index.html'>← Kembali ke ringkasan harian</a></p>")
-    b.append(f"<p class='info'>Diperbarui {wib:%d %b %Y %H:%M} WIB · {len(selesai)} catatan selesai · "
-             f"{len(jalan)} masih berjalan · {len(tunggu)} menunggu masuk</p>")
-    b.append(f"<p class='catatan'>Aturan: masuk di harga pembukaan sehari setelah rekomendasi, keluar saat kena target, "
-             f"kena stop loss, atau setelah {MAKS_HARI} hari bursa. Hasil sudah dipotong biaya {BIAYA * 100:.1f}%. "
+    b.append(f"<p class='info'>Diperbarui {wib:%d %b %Y %H:%M} WIB · {len(selesai)} selesai · {len(jalan)} berjalan · "
+             f"{len(tunggu)} menunggu masuk · {len(batal)} batal</p>")
+    b.append(f"<p class='catatan'>Aturan: pasang beli di batas atas area beli dan tunggu maksimal {TUNGGU_HARI} hari bursa. "
+             f"Kalau harga gak nyentuh, catatannya batal. Setelah masuk, keluar saat kena target, kena stop loss, atau setelah "
+             f"{MAKS_HARI} hari bursa. Hasil sudah dipotong biaya {BIAYA * 100:.1f}%. "
              f"Tanda ⚠️ berarti catatannya belum sampai {MIN_BERARTI}, jadi angkanya belum bisa dijadiin pegangan.</p>")
 
     b.append("<h2>Hasil per rekomendasi</h2>")
@@ -140,12 +167,14 @@ def bikin_halaman(rekam):
              "Kalau urutannya acak, skornya belum terbukti berguna.</p>")
     b.append("<div class='geser'><table>" + KEPALA_RINGKAS.format("Rekomendasi awal"))
     for nama in URUTAN_REKOM:
-        b.append(baris_ringkas(nama, [r for r in selesai if r["rekom"] == nama]))
+        b.append(baris_ringkas(nama, [r for r in selesai if r["rekom"] == nama],
+                               sum(1 for r in batal if r["rekom"] == nama)))
     b.append("</table></div>")
 
     b.append("<h2>Hasil per rentang skor</h2><div class='geser'><table>" + KEPALA_RINGKAS.format("Skor awal"))
     for bawah, atas, nama in RENTANG_SKOR:
-        b.append(baris_ringkas(nama, [r for r in selesai if bawah <= r["skor"] < atas]))
+        b.append(baris_ringkas(nama, [r for r in selesai if bawah <= r["skor"] < atas],
+                               sum(1 for r in batal if bawah <= r["skor"] < atas)))
     b.append("</table></div>")
 
     b.append("<h2>Masih berjalan</h2>")
@@ -158,7 +187,20 @@ def bikin_halaman(rekam):
                      f"<td>{angka(r['target'])}</td><td>{r.get('hari', 0)}</td><td>{pct(r.get('hasil_sementara'))}</td></tr>")
         b.append("</table></div>")
     else:
-        b.append("<p class='info'>Belum ada. Catatan baru masuk di hari bursa setelah rekomendasinya keluar.</p>")
+        b.append("<p class='info'>Belum ada posisi yang masuk.</p>")
+
+    b.append("<h2>Menunggu harga nyentuh area beli</h2>")
+    if tunggu:
+        b.append("<div class='geser'><table><tr><th>Kode</th><th class='kiri'>Rekomendasi awal</th><th>Skor</th>"
+                 "<th>Tanggal sinyal</th><th>Harga saat sinyal</th><th>Pasang beli di</th><th>Stop loss</th><th>Target</th></tr>")
+        for r in sorted(tunggu, key=lambda r: r["skor"], reverse=True):
+            pasang = "pembukaan besok" if r.get("masuk") is None else angka(r["masuk"])
+            b.append(f"<tr><td><b>{r['kode']}</b></td><td class='kiri'>{e(r['rekom'])}</td><td>{r['skor']}</td>"
+                     f"<td>{tgl_pendek(r['tgl_sinyal'])}</td><td>{angka(r['harga_sinyal'])}</td><td>{pasang}</td>"
+                     f"<td>{angka(r['stop'])}</td><td>{angka(r['target'])}</td></tr>")
+        b.append("</table></div>")
+    else:
+        b.append("<p class='info'>Gak ada yang lagi nunggu.</p>")
 
     b.append("<h2>50 catatan selesai terakhir</h2>")
     if selesai:
@@ -207,7 +249,7 @@ def utama():
         except Exception:
             rekam = []
 
-    terbuka = {r["kode"] for r in rekam if r["status"] in ("menunggu", "berjalan")}
+    terbuka = {r["kode"] for r in rekam if r["status"] in TERBUKA}
     semua_kode = sorted(set(data["saham"]) | terbuka)
     ihsg = ambil("^JKSE")
     harga = {}
@@ -234,15 +276,15 @@ def utama():
         c = float(sampai["Close"].iloc[-1])
         a = float(atr(sampai).iloc[-1])
         rekam.append({"kode": kode, "tgl_sinyal": teks_sinyal, "rekom": s["rekom"], "skor": int(s["skor"]),
-                        "harga_sinyal": c, "stop": int(s.get("stop") or bulatkan(c - STOP_ATR * a)),
-                      "target": int(s.get("target") or bulatkan(c + TARGET_ATR * a)),
+                      "harga_sinyal": c, "masuk": s.get("masuk"), "area": s.get("area", ""),
+                      "stop": int(s.get("stop") or bulatkan(c - STOP_ATR * a)),
                       "target": int(s.get("target") or bulatkan(c + TARGET_ATR * a)),
                       "status": "menunggu"})
         baru += 1
 
     # perbarui catatan yang masih terbuka
     for r in rekam:
-        if r["status"] in ("menunggu", "berjalan") and r["kode"] in harga:
+        if r["status"] in TERBUKA and r["kode"] in harga:
             perbarui(r, harga[r["kode"]], ihsg)
 
     os.makedirs("docs", exist_ok=True)
