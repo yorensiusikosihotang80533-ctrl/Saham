@@ -196,7 +196,7 @@ def bikin_rencana(df, harga, a):
         beli_bawah, beli_atas = bulatkan(demand["bawah"]), bulatkan(demand["atas"])
         stop = bulatkan(demand["bawah"] - AREA_BUFFER * a)
         masuk = min(harga, float(beli_atas))
-        posisi = "di" if harga <= beli_atas * 1.01 else "dekat" if harga <= beli_atas + a else "jauh"
+        posisi = "di" if harga <= beli_atas else "dekat" if harga <= beli_atas + a else "jauh"
     else:
         beli_bawah = beli_atas = bulatkan(harga)
         stop, masuk, posisi = bulatkan(harga - STOP_ATR * a), harga, ""
@@ -350,6 +350,9 @@ def proses(kode, ihsg):
          "nilai_harian": nilai_harian, "likuid": likuid,
          "macd": info_macd(df["Close"]), "pakai_macd": round(akhir) > MACD_MIN_SKOR}
     d.update(bikin_rencana(df, harga, a))
+    # Skor bagus tapi ujian gabungan GAGAL = sinyalnya gak bisa dipercaya, jangan dikasih label "Layak beli".
+    if d["rekom"] == LABEL[0] and m["tingkat"] == "gagal":
+        d["rekom"] = LABEL[1]
     d["lot"] = hitung_lot(d["masuk"], d["stop"])
     return d
 
@@ -776,7 +779,7 @@ def bikin_halaman(hasil, perubahan, tgl_pembanding, ihsg, gagal, tanggal_data):
                  f"data-area='{d['posisi_area']}' data-rr='{d['rr']:.2f}'>"
                  f"<td><a href='#{d['kode']}'><b>{d['kode']}</b></a></td><td>{angka(d['harga'])}</td>"
                  f"<td>{d['akhir']:.0f}</td><td>{d['rekom']}</td>"
-                 f"<td>{sinyal} {d['m']['jumlah_beli']}/{d['m']['jumlah']}</td>"
+                 f"<td>{sinyal} <small>({d['m']['jumlah_beli']}/{d['m']['jumlah']} strategi beli)</small></td>"
                  f"<td>{ikon_area[d['posisi_area']]}{teks_area_beli(d)}</td>"
                  f"<td>{angka(d['stop'])}</td><td>{angka(d['target'])}</td><td>{d['rr']:.1f}</td>"
                  f"<td {data_lot(d)}>{d['lot']}</td><td>{d['rasio']:.1f}x</td>"
