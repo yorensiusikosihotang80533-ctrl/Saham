@@ -10,14 +10,23 @@ MIN_LIKUID = 5       # minimal nilai transaksi harian, miliar rupiah
 JUMLAH_TOP = 5       # berapa saham yang ditampilin di bagian "layak beli"
 MACD_MIN_SKOR = 50   # MACD ditampilin buat saham yang skornya di atas angka ini
 MACD_BARU = 3        # cross disebut "baru" kalau terjadi dalam sekian hari bursa terakhir
+AREA_HARI = 250      # area demand/supply dicari dari sekian hari bursa terakhir
+AREA_JENDELA = 5     # titik balik = harga terendah/tertinggi dalam 5 hari sebelum dan sesudahnya
+AREA_MIN_SENTUH = 2  # area yang disentuh minimal segini diutamakan
+AREA_BUFFER = 0.5    # stop loss ditaruh 0,5x gerak harian di bawah area demand
+RR_MIN = 1.5         # untung banding rugi di bawah ini dianggap kurang layak
 BIAYA = 0.002        # perkiraan fee + selisih harga tiap transaksi (0,2%)
-STOP_ATR = 2         # stop loss = harga - 2x gerak harian rata-rata
-TARGET_ATR = 3       # target    = harga + 3x gerak harian rata-rata
+STOP_ATR = 2         # cadangan kalau area demand gak ketemu: stop = harga - 2x gerak harian
+TARGET_ATR = 3       # cadangan kalau area supply gak ketemu: target = harga + 3x gerak harian
 VOLUME_RAMAI = 1.5   # volume disebut ramai kalau 1,5x rata-rata 20 hari
 # =============================================================
 
 LABEL = ["🟢 Layak beli", "🟡 Pantau / cicil", "⚪ Tunggu", "🔴 Hindari dulu", "⚫ Kurang likuid"]
 TEKS_MACD = {"baru-naik": "▲ Baru naik", "naik": "▲ Naik", "baru-turun": "▼ Baru turun", "turun": "▼ Turun"}
+TEKS_AREA = {"di": "✅ Di area beli", "dekat": "🟡 Dekat area beli", "jauh": "⏳ Jauh, tunggu turun",
+             "": "Area demand gak ketemu"}
+KOLOM_FUN = ["PER", "PBV", "ROE", "DER", "Dividen", "Growth"]
+SIMPANAN_FUN = {}
 
 # ---------- AMBIL DATA ----------
 def ambil_harga(kode):
@@ -40,10 +49,19 @@ def ambil_fundamental(kode):
     def angka(k):
         v = info.get(k)
         return float(v) if isinstance(v, (int, float)) and np.isfinite(v) else None
-    return {"nama": info.get("shortName") or kode, "sektor": info.get("sector") or "Lainnya",
-            "PER": angka("trailingPE"), "PBV": angka("priceToBook"),
-            "ROE": angka("returnOnEquity"), "DER": angka("debtToEquity"),
-            "Dividen": angka("trailingAnnualDividendYield"), "Growth": angka("earningsGrowth")}
+    f = {"nama": info.get("shortName"), "sektor": info.get("sector"),
+         "PER": angka("trailingPE"), "PBV": angka("priceToBook"),
+         "ROE": angka("returnOnEquity"), "DER": angka("debtToEquity"),
+         "Dividen": angka("trailingAnnualDividendYield"), "Growth": angka("earningsGrowth")}
+    # kalau Yahoo gagal ngasih sebagian data, pakai simpanan terakhir yang berhasil
+    lama = SIMPANAN_FUN.get(kode, {})
+    for k in f:
+        if f[k] is None and lama.get(k) is not None:
+            f[k] = lama[k]
+    SIMPANAN_FUN[kode] = dict(f)
+    f["nama"] = f["nama"] or kode
+    f["sektor"] = f["sektor"] or "Lainnya"
+    return f
 
 def cek_ihsg():
     try:
@@ -98,6 +116,70 @@ def info_macd(c):
     status = ("baru-" if hari <= MACD_BARU else "") + ("naik" if naik else "turun")
     return {"garis": garis, "sinyal": sinyal, "hist": hist, "status": status, "hari": hari,
             "menguat": bool(hist.iloc[-1] > hist.iloc[-2]), "atas_nol": bool(garis.iloc[-1] > 0)}
+
+# ---------- AREA DEMAND DAN SUPPLY ----------
+def titik_balik(seri, cari_terendah):
+    w = 2 * AREA_JENDELA + 1
+    batas = seri.rolling(w, center=True).min() if cari_terendah else seri.rolling(w, center=True).max()
+    out, terakhir = [], -999
+    for i in np.flatnonzero((seri == batas).to_numpy()):
+        if i - terakhir > AREA_JENDELA:          # hindari satu titik balik kehitung dobel
+            out.append((float(seri.iloc[i]), int(i)))
+        terakhir = i
+    return out
+
+def cari_area(df, harga, a):
+    """Kelompokin titik balik harga yang berdekatan jadi area."""
+    d = df.iloc[-AREA_HARI:]
+    titik = sorted(titik_balik(d["Low"], True) + titik_balik(d["High"], False))
+    lebar = max(a, harga * 0.015)
+    grup_semua, grup = [], []
+    for p, i in titik:
+        if grup and p - grup[0][0] > lebar:
+            grup_semua.append(grup)
+            grup = []
+        grup.append((p, i))
+    if grup:
+        grup_semua.append(grup)
+    area = []
+    for g in grup_semua:
+        area.append({"bawah": min(p for p, _ in g) - 0.25 * a, "atas": max(p for p, _ in g) + 0.25 * a,
+                     "sentuh": len(g), "lalu": len(d) - 1 - max(i for _, i in g)})
+    return area
+
+def pilih_area(calon, kunci, terbesar):
+    kuat = [z for z in calon if z["sentuh"] >= AREA_MIN_SENTUH]
+    daftar = kuat or calon
+    return sorted(daftar, key=kunci, reverse=terbesar)[0] if daftar else None
+
+def bulatkan(h):
+    f = 1 if h < 200 else 2 if h < 500 else 5 if h < 2000 else 10 if h < 5000 else 25
+    return int(max(h, 1) // f * f)
+
+def bikin_rencana(df, harga, a):
+    area = cari_area(df, harga, a)
+    demand = pilih_area([z for z in area if z["bawah"] <= harga], lambda z: z["atas"], True)
+    supply = pilih_area([z for z in area if z["bawah"] > harga], lambda z: z["bawah"], False)
+    if demand:
+        beli_bawah, beli_atas = bulatkan(demand["bawah"]), bulatkan(demand["atas"])
+        stop = bulatkan(demand["bawah"] - AREA_BUFFER * a)
+        masuk = min(harga, float(beli_atas))
+        posisi = "di" if harga <= beli_atas * 1.01 else "dekat" if harga <= beli_atas + a else "jauh"
+    else:
+        beli_bawah = beli_atas = bulatkan(harga)
+        stop, masuk, posisi = bulatkan(harga - STOP_ATR * a), harga, ""
+    if stop >= masuk:
+        stop = bulatkan(masuk - STOP_ATR * a)
+    target = bulatkan(supply["bawah"]) if supply else bulatkan(masuk + TARGET_ATR * a)
+    rr = (target - masuk) / (masuk - stop) if masuk > stop else 0.0
+    return {"demand": demand, "supply": supply, "beli_bawah": beli_bawah, "beli_atas": beli_atas,
+            "masuk": float(masuk), "stop": stop, "target": target, "rr": float(max(rr, 0)), "posisi_area": posisi}
+
+def hitung_lot(masuk, stop):
+    rugi_per_lot = (masuk - stop) * 100
+    if rugi_per_lot <= 0:
+        return 0
+    return int(max(0, min(MODAL * RISIKO / 100 // rugi_per_lot, MODAL // (masuk * 100))))
 
 # ---------- STRATEGI YANG DIUJI ----------
 def posisi_dari_sinyal(masuk, keluar):
@@ -188,17 +270,6 @@ def label(skor):
     if skor >= 40: return LABEL[2]
     return LABEL[3]
 
-# ---------- RENCANA TRANSAKSI ----------
-def bulatkan(h):
-    f = 1 if h < 200 else 2 if h < 500 else 5 if h < 2000 else 10 if h < 5000 else 25
-    return int(max(h, 1) // f * f)
-
-def hitung_lot(harga, stop):
-    rugi_per_lot = (harga - stop) * 100
-    if rugi_per_lot <= 0:
-        return 0
-    return int(max(0, min(MODAL * RISIKO / 100 // rugi_per_lot, MODAL // (harga * 100))))
-
 # ---------- ANALISA SATU SAHAM ----------
 def proses(kode, ihsg):
     df = ambil_harga(kode)
@@ -210,14 +281,15 @@ def proses(kode, ihsg):
     akhir = tek if fun is None else 0.5 * tek + 0.5 * fun
     harga = float(df["Close"].iloc[-1])
     a = float(atr(df).iloc[-1])
-    stop, target = bulatkan(harga - STOP_ATR * a), bulatkan(harga + TARGET_ATR * a)
     likuid = nilai_harian >= MIN_LIKUID * 1e9
-    return {"kode": kode, "df": df, "m": m, "f": f, "tek": tek, "fun": fun, "akhir": akhir,
-            "rekom": label(akhir) if likuid else LABEL[4],
-            "posisi": int(m["pos"].iloc[-1]), "harga": harga, "stop": stop, "target": target,
-            "lot": hitung_lot(harga, stop), "rasio": rasio, "akumulasi": akumulasi,
-            "nilai_harian": nilai_harian, "likuid": likuid,
-            "macd": info_macd(df["Close"]), "pakai_macd": round(akhir) > MACD_MIN_SKOR}
+    d = {"kode": kode, "df": df, "m": m, "f": f, "tek": tek, "fun": fun, "akhir": akhir,
+         "rekom": label(akhir) if likuid else LABEL[4],
+         "posisi": int(m["pos"].iloc[-1]), "harga": harga, "rasio": rasio, "akumulasi": akumulasi,
+         "nilai_harian": nilai_harian, "likuid": likuid,
+         "macd": info_macd(df["Close"]), "pakai_macd": round(akhir) > MACD_MIN_SKOR}
+    d.update(bikin_rencana(df, harga, a))
+    d["lot"] = hitung_lot(d["masuk"], d["stop"])
+    return d
 
 def cari_perubahan(hasil, pembanding):
     out = []
@@ -247,14 +319,19 @@ def fmt(v, persen=False):
 
 def data_lot(d):
     """Atribut yang dibaca halaman buat ngitung ulang lot saat modal diganti."""
-    return f"data-harga='{d['harga']:.2f}' data-stop='{d['stop']}'"
+    return f"data-harga='{d['masuk']:.2f}' data-stop='{d['stop']}'"
+
+def teks_area_beli(d):
+    if not d["demand"]:
+        return "-"
+    return f"{angka(d['beli_bawah'])} - {angka(d['beli_atas'])}"
 
 def bikin_grafik(d, pertama):
     df, m = d["df"], d["m"]
     c = df["Close"]
     lihat = c.iloc[-500:]
-    fig = go.Figure()
     k = df.iloc[-500:]
+    fig = go.Figure()
     fig.add_candlestick(x=k.index, open=k["Open"], high=k["High"], low=k["Low"], close=k["Close"], name="Harga",
                         increasing_line_color="#2e9e4f", decreasing_line_color="#d64545")
     fig.add_scatter(x=lihat.index, y=c.rolling(50).mean().reindex(lihat.index), name="MA50", line=dict(dash="dot"))
@@ -266,6 +343,10 @@ def bikin_grafik(d, pertama):
     fig.add_scatter(x=jual.index, y=jual, mode="markers", name="Sinyal jual",
                     marker=dict(symbol="triangle-down", size=12, color="red"))
     fig.add_vline(x=m["mulai_uji"], line_dash="dash", line_color="gray")
+    if d["demand"]:
+        fig.add_hrect(y0=d["demand"]["bawah"], y1=d["demand"]["atas"], fillcolor="green", opacity=0.15, line_width=0)
+    if d["supply"]:
+        fig.add_hrect(y0=d["supply"]["bawah"], y1=d["supply"]["atas"], fillcolor="red", opacity=0.15, line_width=0)
     fig.add_hline(y=d["stop"], line_dash="dot", line_color="red", annotation_text="Stop loss")
     fig.add_hline(y=d["target"], line_dash="dot", line_color="green", annotation_text="Target")
     fig.update_layout(height=460, margin=dict(l=10, r=10, t=20, b=10), legend=dict(orientation="h"),
@@ -280,13 +361,14 @@ def bikin_grafik(d, pertama):
 
 def bikin_grafik_macd(d):
     mc = d["macd"]
-    hist = mc["hist"].iloc[-500:]
+    hist = mc["hist"].iloc[-120:]
     warna = ["#2e9e4f" if v >= 0 else "#d64545" for v in hist]
     fig = go.Figure()
     fig.add_bar(x=hist.index, y=hist, name="Histogram", marker_color=warna)
     fig.add_scatter(x=hist.index, y=mc["garis"].reindex(hist.index), name="MACD", line=dict(color="#0b5cad"))
     fig.add_scatter(x=hist.index, y=mc["sinyal"].reindex(hist.index), name="Sinyal", line=dict(color="#e08a00"))
     fig.update_layout(height=240, margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h"))
+    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
     return fig.to_html(full_html=False, include_plotlyjs=False,
                        config={"responsive": True, "displayModeBar": False})
 
@@ -299,15 +381,27 @@ def teks_macd_panjang(mc):
 
 def blok_detail(d, pertama, ihsg):
     m, f = d["m"], d["f"]
-    harga, stop, target = d["harga"], d["stop"], d["target"]
+    harga, masuk, stop, target = d["harga"], d["masuk"], d["stop"], d["target"]
     posisi = "PEGANG / BELI" if d["posisi"] == 1 else "DI LUAR / JUAL"
     ujian = "LULUS" if m["lulus"] else "GAGAL, sinyalnya kurang bisa dipercaya"
     teks_fun = "tidak cukup data" if d["fun"] is None else f"{d['fun']:.0f}/100"
     teks_ihsg = {True: "sehat", False: "lemah (skor dipotong 15)", None: "data tidak tersedia"}[ihsg]
     teks_vol = "akumulasi" if d["akumulasi"] else "distribusi"
     teks_likuid = "cukup likuid" if d["likuid"] else "⚠️ KURANG LIKUID, bisa susah dijual"
-    stop_pct = (stop / harga - 1) * 100
-    target_pct = (target / harga - 1) * 100
+    stop_pct = (stop / masuk - 1) * 100
+    target_pct = (target / masuk - 1) * 100
+    if d["demand"]:
+        baris_beli = (f"Area beli (demand): <b>{rp(d['beli_bawah'])} sampai {rp(d['beli_atas'])}</b>, "
+                      f"disentuh {d['demand']['sentuh']} kali setahun terakhir, terakhir {d['demand']['lalu']} hari bursa lalu")
+        asal_stop = "sedikit di bawah area beli"
+    else:
+        baris_beli = "Area demand gak ketemu di bawah harga sekarang, jadi rencana dihitung dari harga sekarang pakai rumus ATR"
+        asal_stop = "rumus ATR"
+    if d["supply"]:
+        asal_target = f"batas bawah area supply, disentuh {d['supply']['sentuh']} kali"
+    else:
+        asal_target = "rumus ATR, karena gak ada area supply di atas harga"
+    layak = "layak" if d["rr"] >= RR_MIN else f"kurang layak, di bawah {RR_MIN:g}"
     atribut = data_lot(d)
     grafik = bikin_grafik(d, pertama)
     grafik_macd = bikin_grafik_macd(d) if d["pakai_macd"] else ""
@@ -316,10 +410,15 @@ def blok_detail(d, pertama, ihsg):
 <summary><b>{d['kode']}</b> {e(f['nama'])} · {d['rekom']} · skor {d['akhir']:.0f}</summary>
 {grafik}
 {grafik_macd}
-<button class="tv" type="button" data-kode="{d['kode']}">Tampilkan grafik TradingView</button><div></div><p class="info">Sektor: {e(f['sektor'])} · <a href="https://www.tradingview.com/chart/?symbol=IDX:{d['kode']}" target="_blank" rel="noopener">Buka di TradingView ↗</a> · <a href="https://stockbit.com/symbol/{d['kode']}" target="_blank" rel="noopener">Buka di Stockbit ↗</a></p>
-<p><b>Rencana transaksi</b> (kalau masuk di harga sekarang)</p>
+<button class="tv" type="button" data-kode="{d['kode']}">Tampilkan grafik TradingView</button><div></div>
+<p class="info">Sektor: {e(f['sektor'])} · <a href="https://www.tradingview.com/chart/?symbol=IDX:{d['kode']}" target="_blank" rel="noopener">Buka di TradingView ↗</a> · <a href="https://stockbit.com/symbol/{d['kode']}" target="_blank" rel="noopener">Buka di Stockbit ↗</a></p>
+<p><b>Rencana transaksi</b></p>
 <ul>
-<li>Harga {rp(harga)} · Stop loss <b>{rp(stop)}</b> ({stop_pct:+.1f}%) · Target <b>{rp(target)}</b> ({target_pct:+.1f}%)</li>
+<li>Harga sekarang {rp(harga)} · <b>{TEKS_AREA[d['posisi_area']]}</b></li>
+<li>{baris_beli}</li>
+<li>Stop loss <b>{rp(stop)}</b> ({stop_pct:+.1f}% dari harga masuk acuan {rp(masuk)}), {asal_stop}</li>
+<li>Target <b>{rp(target)}</b> ({target_pct:+.1f}%), {asal_target}</li>
+<li>Untung banding rugi: <b>{d['rr']:.1f} banding 1</b> ({layak})</li>
 <li>Maksimal beli: <span data-mode='panjang' {atribut}>{d['lot']} lot</span></li>
 </ul>
 <p><b>Teknikal: {d['tek']:.0f}/100</b></p>
@@ -339,7 +438,7 @@ def blok_detail(d, pertama, ihsg):
 </details>"""
 
 CSS = """
-body{font-family:system-ui,sans-serif;max-width:1000px;margin:0 auto;padding:16px;color:#1a1a1a;background:#fafafa;line-height:1.5}
+body{font-family:system-ui,sans-serif;max-width:1100px;margin:0 auto;padding:16px;color:#1a1a1a;background:#fafafa;line-height:1.5}
 h1{font-size:1.5rem;margin-bottom:0} h2{font-size:1.15rem;margin-top:32px;border-bottom:2px solid #ddd;padding-bottom:4px}
 .info{color:#555;font-size:.9rem} .peringatan{background:#fff3cd;padding:8px 12px;border-radius:8px}
 .modal-box{background:#eef5ff;border:1px solid #b9d3f5;border-radius:8px;padding:12px;margin:16px 0}
@@ -350,15 +449,16 @@ h1{font-size:1.5rem;margin-bottom:0} h2{font-size:1.15rem;margin-top:32px;border
 .filter input[type=text],.filter select,.filter button{font-size:.95rem;padding:6px 8px;border:1px solid #999;border-radius:6px;background:#fff}
 .filter #f-cari{width:190px} .filter #f-skor{width:50px} .filter button{cursor:pointer}
 .filter label{font-size:.9rem} #f-jumlah{width:100%;font-size:.9rem;color:#555}
-.kartu-wrap{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px}
+.kartu-wrap{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:12px}
 .kartu{background:#fff;border:1px solid #ddd;border-left:5px solid #2e9e4f;border-radius:8px;padding:12px}
 .kartu .kode{font-size:1.2rem;font-weight:700} .kartu .skor{float:right;color:#2e9e4f;font-weight:700}
 .kartu small{color:#555}
 .geser{overflow-x:auto} table{border-collapse:collapse;width:100%;background:#fff;font-size:.9rem}
 th,td{padding:6px 10px;border-bottom:1px solid #e5e5e5;text-align:right;white-space:nowrap}
-th:first-child,td:first-child,th:nth-child(4),td:nth-child(4),th:nth-child(10),td:nth-child(10),th:last-child,td:last-child{text-align:left}
+th:first-child,td:first-child,th:nth-child(4),td:nth-child(4),th:nth-child(6),td:nth-child(6),th:nth-child(12),td:nth-child(12),th:last-child,td:last-child{text-align:left}
 th{background:#f0f0f0;cursor:pointer;user-select:none}
 details{background:#fff;border:1px solid #ddd;border-radius:8px;padding:10px 14px;margin:8px 0}
+button.tv{font-size:.9rem;padding:6px 12px;border:1px solid #999;border-radius:6px;background:#fff;cursor:pointer;margin:8px 0}
 summary{cursor:pointer} a{color:#0b5cad;text-decoration:none} footer{margin-top:32px;color:#777;font-size:.8rem}
 """
 
@@ -377,17 +477,21 @@ function muatTV(tombol){
   var s=document.createElement('script');
   s.src='https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js';
   s.async=true;
-    s.innerHTML=JSON.stringify({autosize:true,symbol:'IDX:'+tombol.dataset.kode,interval:'D',timezone:'Asia/Jakarta',theme:'light',style:'1',locale:'id',allow_symbol_change:false,withdateranges:true,hide_side_toolbar:false,studies:['STD;SMA','STD;MACD','STD;RSI']});
+  s.innerHTML=JSON.stringify({autosize:true,symbol:'IDX:'+tombol.dataset.kode,interval:'D',timezone:'Asia/Jakarta',theme:'light',style:'1',locale:'id',allow_symbol_change:false,withdateranges:true,hide_side_toolbar:false,studies:['STD;SMA','STD;MACD','STD;RSI']});
   wadah.firstChild.appendChild(s);
   tombol.style.display='none';
 }
 document.querySelectorAll('button.tv').forEach(function(t){t.addEventListener('click',function(){muatTV(t);});});
+
+// ----- filter -----
 function ambilNilai(id){return document.getElementById(id).value;}
 function saring(){
   var cari=ambilNilai('f-cari').toUpperCase().split(/[ ,]+/).filter(function(k){return k;});
-  var rekom=ambilNilai('f-rekom'), sinyal=ambilNilai('f-sinyal'), sektor=ambilNilai('f-sektor'), macd=ambilNilai('f-macd');
+  var rekom=ambilNilai('f-rekom'), sinyal=ambilNilai('f-sinyal'), sektor=ambilNilai('f-sektor');
+  var macd=ambilNilai('f-macd'), area=ambilNilai('f-area');
   var skor=parseFloat(ambilNilai('f-skor'))||0;
   var lulus=document.getElementById('f-lulus').checked, kebeli=document.getElementById('f-lot').checked;
+  var rrOk=document.getElementById('f-rr').checked;
   var tampil={}, n=0, semua=0;
   document.querySelectorAll('tr.baris').forEach(function(tr){
     semua++;
@@ -395,6 +499,7 @@ function saring(){
     var okMacd=!macd||(macd.indexOf('baru')===0?d.macd===macd:d.macd.indexOf(macd)>=0);
     var ok=(cari.length===0||cari.some(function(k){return d.kode.indexOf(k)>=0;}))
       &&(!rekom||d.rekom===rekom)&&(!sinyal||d.sinyal===sinyal)&&(!sektor||d.sektor===sektor)&&okMacd
+      &&(!area||d.area===area)&&(!rrOk||parseFloat(d.rr)>=RR_MIN_NILAI)
       &&parseFloat(d.skor)>=skor&&(!lulus||d.lulus==='1')&&(!kebeli||lot>=1);
     tr.style.display=ok?'':'none'; tampil[d.kode]=ok; if(ok){n++;}
   });
@@ -402,11 +507,11 @@ function saring(){
   document.getElementById('f-jumlah').textContent='Menampilkan '+n+' dari '+semua+' saham';
 }
 ['f-cari','f-skor'].forEach(function(id){document.getElementById(id).addEventListener('input',saring);});
-['f-rekom','f-sinyal','f-sektor','f-macd','f-lulus','f-lot'].forEach(function(id){document.getElementById(id).addEventListener('change',saring);});
+['f-rekom','f-sinyal','f-sektor','f-macd','f-area','f-lulus','f-lot','f-rr'].forEach(function(id){document.getElementById(id).addEventListener('change',saring);});
 document.getElementById('f-reset').addEventListener('click',function(){
-  ['f-cari','f-rekom','f-sinyal','f-sektor','f-macd'].forEach(function(id){document.getElementById(id).value='';});
+  ['f-cari','f-rekom','f-sinyal','f-sektor','f-macd','f-area'].forEach(function(id){document.getElementById(id).value='';});
   document.getElementById('f-skor').value='0';
-  document.getElementById('f-lulus').checked=false; document.getElementById('f-lot').checked=false;
+  ['f-lulus','f-lot','f-rr'].forEach(function(id){document.getElementById(id).checked=false;});
   saring();
 });
 
@@ -462,6 +567,8 @@ def bikin_filter(hasil):
             f"<select id='f-rekom'><option value=''>Semua rekomendasi</option>{pilihan_rekom}</select>"
             "<select id='f-sinyal'><option value=''>Semua sinyal</option><option value='Beli'>Beli</option>"
             "<option value='Jual'>Jual</option></select>"
+            "<select id='f-area'><option value=''>Semua posisi harga</option><option value='di'>Di area beli</option>"
+            "<option value='dekat'>Dekat area beli</option><option value='jauh'>Jauh dari area beli</option></select>"
             "<select id='f-macd'><option value=''>Semua MACD</option><option value='naik'>MACD naik</option>"
             "<option value='baru-naik'>MACD baru naik</option><option value='turun'>MACD turun</option>"
             "<option value='baru-turun'>MACD baru turun</option></select>"
@@ -469,6 +576,7 @@ def bikin_filter(hasil):
             "<label>Skor minimal <input id='f-skor' type='text' inputmode='numeric' value='0'></label>"
             "<label><input type='checkbox' id='f-lulus'> Cuma yang lulus ujian</label>"
             "<label><input type='checkbox' id='f-lot'> Cuma yang kebeli</label>"
+            f"<label><input type='checkbox' id='f-rr'> U:R minimal {RR_MIN:g}</label>"
             "<button id='f-reset' type='button'>Reset</button>"
             "<div id='f-jumlah'></div></div>")
 
@@ -504,10 +612,13 @@ def bikin_halaman(hasil, perubahan, tgl_pembanding, ihsg, gagal, tanggal_data):
         b.append("<div class='kartu-wrap'>")
         for d in top:
             macd_kartu = "<br>MACD " + TEKS_MACD[d["macd"]["status"]] if d["pakai_macd"] else ""
+            beli = f"Area beli Rp {teks_area_beli(d)}<br>" if d["demand"] else ""
             b.append(f"<div class='kartu'><span class='skor'>{d['akhir']:.0f}</span>"
                      f"<div class='kode'><a href='#{d['kode']}'>{d['kode']}</a></div>"
                      f"<small>{e(d['f']['nama'])}</small><br>"
-                     f"Harga {rp(d['harga'])}<br>Stop loss {rp(d['stop'])}<br>Target {rp(d['target'])}<br>"
+                     f"Harga {rp(d['harga'])}<br>{beli}{TEKS_AREA[d['posisi_area']]}<br>"
+                     f"Stop loss {rp(d['stop'])}<br>Target {rp(d['target'])}<br>"
+                     f"Untung banding rugi {d['rr']:.1f} : 1<br>"
                      f"Maks <b><span {data_lot(d)}>{d['lot']}</span> lot</b>{macd_kartu}</div>")
         b.append("</div>")
     else:
@@ -528,10 +639,12 @@ def bikin_halaman(hasil, perubahan, tgl_pembanding, ihsg, gagal, tanggal_data):
     # --- Peringkat + filter ---
     b.append("<h2>Peringkat lengkap</h2>")
     b.append(bikin_filter(hasil))
-    b.append(f"<p class='info'>Klik judul kolom buat ngurutin. Kolom MACD cuma keisi buat saham dengan skor di atas {MACD_MIN_SKOR}.</p>")
+    b.append(f"<p class='info'>Klik judul kolom buat ngurutin. U:R = untung banding rugi. "
+             f"Kolom MACD cuma keisi buat saham dengan skor di atas {MACD_MIN_SKOR}.</p>")
     b.append("<div class='geser'><table id='tabel-peringkat'><tr><th>Kode</th><th>Harga</th><th>Skor</th>"
-             "<th>Rekomendasi</th><th>Sinyal</th><th>Stop loss</th><th>Target</th><th>Maks lot</th>"
-             "<th>Volume</th><th>MACD</th><th>Sektor</th></tr>")
+             "<th>Rekomendasi</th><th>Sinyal</th><th>Area beli</th><th>Stop loss</th><th>Target</th><th>U:R</th>"
+             "<th>Maks lot</th><th>Volume</th><th>MACD</th><th>Sektor</th></tr>")
+    ikon_area = {"di": "✅ ", "dekat": "🟡 ", "jauh": "⏳ ", "": ""}
     for d in hasil:
         sinyal = "Beli" if d["posisi"] == 1 else "Jual"
         lulus = "1" if d["m"]["lulus"] else "0"
@@ -539,26 +652,37 @@ def bikin_halaman(hasil, perubahan, tgl_pembanding, ihsg, gagal, tanggal_data):
         kode_macd = d["macd"]["status"] if d["pakai_macd"] else ""
         teks_macd = TEKS_MACD[kode_macd] if kode_macd else "-"
         b.append(f"<tr class='baris' data-kode='{d['kode']}' data-skor='{d['akhir']:.0f}' data-rekom='{e(d['rekom'])}' "
-                 f"data-sinyal='{sinyal}' data-lulus='{lulus}' data-sektor='{sektor}' data-macd='{kode_macd}'>"
+                 f"data-sinyal='{sinyal}' data-lulus='{lulus}' data-sektor='{sektor}' data-macd='{kode_macd}' "
+                 f"data-area='{d['posisi_area']}' data-rr='{d['rr']:.2f}'>"
                  f"<td><a href='#{d['kode']}'><b>{d['kode']}</b></a></td><td>{angka(d['harga'])}</td>"
                  f"<td>{d['akhir']:.0f}</td><td>{d['rekom']}</td><td>{sinyal}</td>"
-                 f"<td>{angka(d['stop'])}</td><td>{angka(d['target'])}</td>"
+                 f"<td>{ikon_area[d['posisi_area']]}{teks_area_beli(d)}</td>"
+                 f"<td>{angka(d['stop'])}</td><td>{angka(d['target'])}</td><td>{d['rr']:.1f}</td>"
                  f"<td {data_lot(d)}>{d['lot']}</td><td>{d['rasio']:.1f}x</td>"
                  f"<td>{teks_macd}</td><td>{sektor}</td></tr>")
     b.append("</table></div>")
 
     # --- Detail ---
-    b.append("<h2>Detail per saham</h2><p class='info'>Klik buat buka grafik dan penjelasannya. Bagian ini ikut filter di atas.</p>")
+    b.append("<h2>Detail per saham</h2><p class='info'>Klik buat buka grafik dan penjelasannya. Pita hijau di grafik = area demand, "
+             "pita merah = area supply. Bagian ini ikut filter di atas.</p>")
     for i, d in enumerate(hasil):
         b.append(blok_detail(d, i == 0, ihsg))
 
     b.append("<footer>Bukan saran investasi. Performa masa lalu tidak menjamin hasil ke depan. "
              "Data dari Yahoo Finance, bisa telat atau tidak lengkap.</footer>")
-    b.append("<script>" + JS + "</script></body></html>")
+    b.append("<script>" + JS.replace("RR_MIN_NILAI", str(RR_MIN)) + "</script></body></html>")
     return "\n".join(b)
 
 # ---------- JALANKAN ----------
 def utama():
+    os.makedirs("docs", exist_ok=True)
+    if os.path.exists("docs/fundamental.json"):
+        try:
+            with open("docs/fundamental.json", encoding="utf-8") as fh:
+                SIMPANAN_FUN.update(json.load(fh))
+        except Exception:
+            pass
+
     daftar = baca_daftar()
     ihsg = cek_ihsg()
     hasil, gagal = [], []
@@ -576,11 +700,10 @@ def utama():
     hasil.sort(key=lambda d: d["akhir"], reverse=True)
     tanggal_data = max(d["df"].index[-1] for d in hasil).strftime("%d %b %Y")
 
-    os.makedirs("docs", exist_ok=True)
     lama = {}
     if os.path.exists("docs/data.json"):
         try:
-            with open("docs/data.json") as fh:
+            with open("docs/data.json", encoding="utf-8") as fh:
                 lama = json.load(fh)
         except Exception:
             lama = {}
@@ -592,10 +715,13 @@ def utama():
 
     with open("docs/index.html", "w", encoding="utf-8") as fh:
         fh.write(bikin_halaman(hasil, perubahan, tgl_pembanding, ihsg, gagal, tanggal_data))
-    sekarang = {d["kode"]: {"rekom": d["rekom"], "posisi": d["posisi"], "skor": round(d["akhir"])} for d in hasil}
+    sekarang = {d["kode"]: {"rekom": d["rekom"], "posisi": d["posisi"], "skor": round(d["akhir"]),
+                            "stop": d["stop"], "target": d["target"]} for d in hasil}
     with open("docs/data.json", "w", encoding="utf-8") as fh:
         json.dump({"tanggal": tanggal_data, "saham": sekarang,
                    "sebelumnya": pembanding, "tanggal_sebelumnya": tgl_pembanding}, fh, ensure_ascii=False)
+    with open("docs/fundamental.json", "w", encoding="utf-8") as fh:
+        json.dump(SIMPANAN_FUN, fh, ensure_ascii=False)
     print("Selesai:", len(hasil), "saham,", len(gagal), "gagal")
 
 utama()
