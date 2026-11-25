@@ -12,9 +12,11 @@ MACD_MIN_SKOR = 50   # MACD ditampilin buat saham yang skornya di atas angka ini
 MACD_BARU = 3        # cross disebut "baru" kalau terjadi dalam sekian hari bursa terakhir
 AREA_HARI = 250      # area demand/supply dicari dari sekian hari bursa terakhir
 AREA_JENDELA = 5     # titik balik = harga terendah/tertinggi dalam 5 hari sebelum dan sesudahnya
-AREA_MIN_SENTUH = 2  # area yang disentuh minimal segini diutamakan
+AREA_MIN_SENTUH = 2  # area yang disentuh kurang dari ini ditandai lemah
 AREA_BUFFER = 0.5    # stop loss ditaruh 0,5x gerak harian di bawah area demand
+TARGET_MAKS_ATR = 6  # target paling jauh 6x gerak harian dari harga masuk
 RR_MIN = 1.5         # untung banding rugi di bawah ini dianggap kurang layak
+PBV_MAKS = 50        # PBV di atas ini dianggap data rusak (biasanya laporan dalam dolar)
 BIAYA = 0.002        # perkiraan fee + selisih harga tiap transaksi (0,2%)
 STOP_ATR = 2         # cadangan kalau area demand gak ketemu: stop = harga - 2x gerak harian
 TARGET_ATR = 3       # cadangan kalau area supply gak ketemu: target = harga + 3x gerak harian
@@ -25,21 +27,45 @@ LABEL = ["🟢 Layak beli", "🟡 Pantau / cicil", "⚪ Tunggu", "🔴 Hindari d
 TEKS_MACD = {"baru-naik": "▲ Baru naik", "naik": "▲ Naik", "baru-turun": "▼ Baru turun", "turun": "▼ Turun"}
 TEKS_AREA = {"di": "✅ Di area beli", "dekat": "🟡 Dekat area beli", "jauh": "⏳ Jauh, tunggu turun",
              "": "Area demand gak ketemu"}
-KOLOM_FUN = ["PER", "PBV", "ROE", "DER", "Dividen", "Growth"]
+TEKS_UJI = {"lulus": "LULUS", "tipis": "LULUS TIPIS, kalah jauh dari beli-diamkan",
+            "gagal": "GAGAL, sinyalnya kurang bisa dipercaya"}
+BOBOT_UJI = {"lulus": 1.0, "tipis": 0.7, "gagal": 0.4}
 SIMPANAN_FUN = {}
 
 # ---------- AMBIL DATA ----------
 def ambil_harga(kode):
+    """Harga asli (belum disesuaiin dividen) plus kolom Adj Close dan Dividends."""
     for _ in range(3):
         try:
-            df = yf.Ticker(kode + ".JK").history(period="5y", auto_adjust=True)
+            df = yf.Ticker(kode + ".JK").history(period="5y", auto_adjust=False)
             if df is not None and len(df) >= 300:
+                df = df.copy()
                 df.index = pd.to_datetime(df.index).tz_localize(None)
-                return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+                if "Adj Close" not in df.columns:
+                    df["Adj Close"] = df["Close"]
+                if "Dividends" not in df.columns:
+                    df["Dividends"] = 0.0
+                df = df[["Open", "High", "Low", "Close", "Adj Close", "Volume", "Dividends"]]
+                df = df.dropna(subset=["Open", "High", "Low", "Close"]).copy()
+                df["Adj Close"] = df["Adj Close"].fillna(df["Close"])
+                df["Dividends"] = df["Dividends"].fillna(0.0)
+                if len(df) >= 300:
+                    return df
         except Exception:
             pass
         time.sleep(3)
     return None
+
+def versi_disesuaikan(df):
+    """Harga yang sudah disesuaiin dividen, khusus buat nguji strategi dan ngukur tren."""
+    f = df["Adj Close"] / df["Close"]
+    return pd.DataFrame({"High": df["High"] * f, "Low": df["Low"] * f,
+                         "Close": df["Adj Close"], "Volume": df["Volume"]})
+
+def hitung_dividen(df, harga):
+    batas = df.index[-1] - pd.Timedelta(days=365)
+    total_div = float(df["Dividends"][df.index > batas].sum())
+    return total_div / harga if harga > 0 else None
 
 def ambil_fundamental(kode):
     try:
@@ -52,12 +78,17 @@ def ambil_fundamental(kode):
     f = {"nama": info.get("shortName"), "sektor": info.get("sector"),
          "PER": angka("trailingPE"), "PBV": angka("priceToBook"),
          "ROE": angka("returnOnEquity"), "DER": angka("debtToEquity"),
-         "Dividen": angka("trailingAnnualDividendYield"), "Growth": angka("earningsGrowth")}
+         "Dividen": None, "Growth": angka("earningsGrowth")}
     # kalau Yahoo gagal ngasih sebagian data, pakai simpanan terakhir yang berhasil
     lama = SIMPANAN_FUN.get(kode, {})
     for k in f:
         if f[k] is None and lama.get(k) is not None:
             f[k] = lama[k]
+    # buang angka yang jelas rusak
+    if f["PBV"] is not None and (f["PBV"] <= 0 or f["PBV"] > PBV_MAKS):
+        f["PBV"] = None
+    if f["PER"] is not None and abs(f["PER"]) > 1000:
+        f["PER"] = None
     SIMPANAN_FUN[kode] = dict(f)
     f["nama"] = f["nama"] or kode
     f["sektor"] = f["sektor"] or "Lainnya"
@@ -118,6 +149,13 @@ def info_macd(c):
             "menguat": bool(hist.iloc[-1] > hist.iloc[-2]), "atas_nol": bool(garis.iloc[-1] > 0)}
 
 # ---------- AREA DEMAND DAN SUPPLY ----------
+def fraksi(h):
+    return 1 if h < 200 else 2 if h < 500 else 5 if h < 2000 else 10 if h < 5000 else 25
+
+def bulatkan(h):
+    f = fraksi(h)
+    return int(max(h, 1) // f * f)
+
 def titik_balik(seri, cari_terendah):
     w = 2 * AREA_JENDELA + 1
     batas = seri.rolling(w, center=True).min() if cari_terendah else seri.rolling(w, center=True).max()
@@ -147,19 +185,16 @@ def cari_area(df, harga, a):
                      "sentuh": len(g), "lalu": len(d) - 1 - max(i for _, i in g)})
     return area
 
-def pilih_area(calon, kunci, terbesar):
-    kuat = [z for z in calon if z["sentuh"] >= AREA_MIN_SENTUH]
-    daftar = kuat or calon
-    return sorted(daftar, key=kunci, reverse=terbesar)[0] if daftar else None
-
-def bulatkan(h):
-    f = 1 if h < 200 else 2 if h < 500 else 5 if h < 2000 else 10 if h < 5000 else 25
-    return int(max(h, 1) // f * f)
-
 def bikin_rencana(df, harga, a):
     area = cari_area(df, harga, a)
-    demand = pilih_area([z for z in area if z["bawah"] <= harga], lambda z: z["atas"], True)
-    supply = pilih_area([z for z in area if z["bawah"] > harga], lambda z: z["bawah"], False)
+    # demand = area terdekat yang ada di bawah harga atau yang lagi ditempati harga
+    calon_d = [z for z in area if z["bawah"] <= harga]
+    demand = max(calon_d, key=lambda z: z["atas"]) if calon_d else None
+    # supply = area terdekat yang benar-benar di atas harga DAN di atas area beli
+    lantai = max(harga, demand["atas"]) if demand else harga
+    calon_s = [z for z in area if z["bawah"] > lantai]
+    supply = min(calon_s, key=lambda z: z["bawah"]) if calon_s else None
+
     if demand:
         beli_bawah, beli_atas = bulatkan(demand["bawah"]), bulatkan(demand["atas"])
         stop = bulatkan(demand["bawah"] - AREA_BUFFER * a)
@@ -170,10 +205,20 @@ def bikin_rencana(df, harga, a):
         stop, masuk, posisi = bulatkan(harga - STOP_ATR * a), harga, ""
     if stop >= masuk:
         stop = bulatkan(masuk - STOP_ATR * a)
-    target = bulatkan(supply["bawah"]) if supply else bulatkan(masuk + TARGET_ATR * a)
+
+    batas_target = masuk + TARGET_MAKS_ATR * a
+    if supply and supply["bawah"] <= batas_target:
+        target, asal = bulatkan(supply["bawah"]), "supply"
+    elif supply:
+        target, asal = bulatkan(batas_target), "dibatasi"
+    else:
+        target, asal = bulatkan(masuk + TARGET_ATR * a), "atr"
+    if target <= masuk:
+        target = bulatkan(masuk) + fraksi(masuk)
     rr = (target - masuk) / (masuk - stop) if masuk > stop else 0.0
     return {"demand": demand, "supply": supply, "beli_bawah": beli_bawah, "beli_atas": beli_atas,
-            "masuk": float(masuk), "stop": stop, "target": target, "rr": float(max(rr, 0)), "posisi_area": posisi}
+            "masuk": float(masuk), "stop": stop, "target": target, "asal_target": asal,
+            "rr": float(max(rr, 0)), "posisi_area": posisi}
 
 def hitung_lot(masuk, stop):
     rugi_per_lot = (masuk - stop) * 100
@@ -226,14 +271,21 @@ def belajar(df):
             terbaik = {"nama": nama, "pos": pos, "sharpe_latih": nilai,
                        "ret_uji": total(r.iloc[batas:]), "sharpe_uji": sharpe(r.iloc[batas:])}
     terbaik["bh_uji"] = total(c.pct_change().fillna(0).iloc[batas:])
-    terbaik["lulus"] = terbaik["ret_uji"] > 0 and terbaik["sharpe_uji"] > 0
+    untung = terbaik["ret_uji"] > 0 and terbaik["sharpe_uji"] > 0
+    if not untung:
+        terbaik["tingkat"] = "gagal"
+    elif terbaik["bh_uji"] > 0 and terbaik["ret_uji"] < 0.5 * terbaik["bh_uji"]:
+        terbaik["tingkat"] = "tipis"
+    else:
+        terbaik["tingkat"] = "lulus"
+    terbaik["lulus"] = terbaik["tingkat"] == "lulus"
     terbaik["mulai_uji"] = df.index[batas]
     return terbaik
 
 # ---------- SKOR ----------
 def skor_teknikal(df, m, akumulasi, ihsg_sehat):
     c = df["Close"]
-    bobot = 1.0 if m["lulus"] else 0.4
+    bobot = BOBOT_UJI[m["tingkat"]]
     skor = 50 + (25 if m["pos"].iloc[-1] == 1 else -25) * bobot
     skor += 12 if c.iloc[-1] > c.rolling(200).mean().iloc[-1] else -12
     skor += 8 if c.iloc[-1] > c.iloc[-63] else -8
@@ -275,11 +327,13 @@ def proses(kode, ihsg):
     df = ambil_harga(kode)
     if df is None:
         return None
-    m, f = belajar(df), ambil_fundamental(kode)
-    rasio, akumulasi, nilai_harian = info_volume(df)
-    tek, fun = skor_teknikal(df, m, akumulasi, ihsg), skor_fundamental(f)
-    akhir = tek if fun is None else 0.5 * tek + 0.5 * fun
+    dfa = versi_disesuaikan(df)
     harga = float(df["Close"].iloc[-1])
+    m, f = belajar(dfa), ambil_fundamental(kode)
+    f["Dividen"] = hitung_dividen(df, harga)
+    rasio, akumulasi, nilai_harian = info_volume(df)
+    tek, fun = skor_teknikal(dfa, m, akumulasi, ihsg), skor_fundamental(f)
+    akhir = tek if fun is None else 0.5 * tek + 0.5 * fun
     a = float(atr(df).iloc[-1])
     likuid = nilai_harian >= MIN_LIKUID * 1e9
     d = {"kode": kode, "df": df, "m": m, "f": f, "tek": tek, "fun": fun, "akhir": akhir,
@@ -316,6 +370,9 @@ def rp(x):
 def fmt(v, persen=False):
     if v is None: return "tidak ada data"
     return f"{v*100:.1f}%" if persen else f"{v:.2f}"
+
+def fmt_der(v):
+    return "tidak ada data" if v is None else f"{v / 100:.2f}x"
 
 def data_lot(d):
     """Atribut yang dibaca halaman buat ngitung ulang lot saat modal diganti."""
@@ -379,11 +436,15 @@ def teks_macd_panjang(mc):
     nol = "di atas garis nol (tren menengah naik)" if mc["atas_nol"] else "di bawah garis nol (tren menengah masih turun)"
     return f"MACD: <b>{arah}</b>, cross terakhir {sejak}. Histogram {tenaga}. Garis MACD {nol}."
 
+def kekuatan(z):
+    lemah = " (area lemah)" if z["sentuh"] < AREA_MIN_SENTUH else ""
+    return f"disentuh {z['sentuh']} kali setahun terakhir, terakhir {z['lalu']} hari bursa lalu{lemah}"
+
 def blok_detail(d, pertama, ihsg):
     m, f = d["m"], d["f"]
     harga, masuk, stop, target = d["harga"], d["masuk"], d["stop"], d["target"]
     posisi = "PEGANG / BELI" if d["posisi"] == 1 else "DI LUAR / JUAL"
-    ujian = "LULUS" if m["lulus"] else "GAGAL, sinyalnya kurang bisa dipercaya"
+    ujian = TEKS_UJI[m["tingkat"]]
     teks_fun = "tidak cukup data" if d["fun"] is None else f"{d['fun']:.0f}/100"
     teks_ihsg = {True: "sehat", False: "lemah (skor dipotong 15)", None: "data tidak tersedia"}[ihsg]
     teks_vol = "akumulasi" if d["akumulasi"] else "distribusi"
@@ -392,13 +453,16 @@ def blok_detail(d, pertama, ihsg):
     target_pct = (target / masuk - 1) * 100
     if d["demand"]:
         baris_beli = (f"Area beli (demand): <b>{rp(d['beli_bawah'])} sampai {rp(d['beli_atas'])}</b>, "
-                      f"disentuh {d['demand']['sentuh']} kali setahun terakhir, terakhir {d['demand']['lalu']} hari bursa lalu")
+                      + kekuatan(d["demand"]))
         asal_stop = "sedikit di bawah area beli"
     else:
         baris_beli = "Area demand gak ketemu di bawah harga sekarang, jadi rencana dihitung dari harga sekarang pakai rumus ATR"
         asal_stop = "rumus ATR"
-    if d["supply"]:
-        asal_target = f"batas bawah area supply, disentuh {d['supply']['sentuh']} kali"
+    if d["asal_target"] == "supply":
+        asal_target = "batas bawah area supply, " + kekuatan(d["supply"])
+    elif d["asal_target"] == "dibatasi":
+        asal_target = (f"dibatasi {TARGET_MAKS_ATR}x gerak harian, karena area supply terdekat masih jauh "
+                       f"(mulai {rp(bulatkan(d['supply']['bawah']))})")
     else:
         asal_target = "rumus ATR, karena gak ada area supply di atas harga"
     layak = "layak" if d["rr"] >= RR_MIN else f"kurang layak, di bawah {RR_MIN:g}"
@@ -433,7 +497,7 @@ def blok_detail(d, pertama, ihsg):
 <p><b>Fundamental: {teks_fun}</b></p>
 <ul>
 <li>PER {fmt(f['PER'])} · PBV {fmt(f['PBV'])} · ROE {fmt(f['ROE'], True)}</li>
-<li>DER {fmt(f['DER'])} · Dividen {fmt(f['Dividen'], True)} · Pertumbuhan laba {fmt(f['Growth'], True)}</li>
+<li>Utang banding modal (DER) {fmt_der(f['DER'])} · Dividen setahun terakhir {fmt(f['Dividen'], True)} · Pertumbuhan laba {fmt(f['Growth'], True)}</li>
 </ul>
 </details>"""
 
@@ -716,7 +780,9 @@ def utama():
     with open("docs/index.html", "w", encoding="utf-8") as fh:
         fh.write(bikin_halaman(hasil, perubahan, tgl_pembanding, ihsg, gagal, tanggal_data))
     sekarang = {d["kode"]: {"rekom": d["rekom"], "posisi": d["posisi"], "skor": round(d["akhir"]),
-                            "stop": d["stop"], "target": d["target"]} for d in hasil}
+                            "stop": d["stop"], "target": d["target"],
+                            "masuk": d["masuk"] if d["demand"] else None, "area": d["posisi_area"]}
+                for d in hasil}
     with open("docs/data.json", "w", encoding="utf-8") as fh:
         json.dump({"tanggal": tanggal_data, "saham": sekarang,
                    "sebelumnya": pembanding, "tanggal_sebelumnya": tgl_pembanding}, fh, ensure_ascii=False)
