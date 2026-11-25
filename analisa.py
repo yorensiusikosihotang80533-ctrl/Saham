@@ -316,7 +316,7 @@ def blok_detail(d, pertama, ihsg):
 <summary><b>{d['kode']}</b> {e(f['nama'])} · {d['rekom']} · skor {d['akhir']:.0f}</summary>
 {grafik}
 {grafik_macd}
-<p class="info">Sektor: {e(f['sektor'])} · <a href="https://www.tradingview.com/chart/?symbol=IDX:{d['kode']}" target="_blank" rel="noopener">Buka di TradingView ↗</a> · <a href="https://stockbit.com/symbol/{d['kode']}" target="_blank" rel="noopener">Buka di Stockbit ↗</a></p>
+<button class="tv" type="button" data-kode="{d['kode']}">Tampilkan grafik TradingView</button><div></div><p class="info">Sektor: {e(f['sektor'])} · <a href="https://www.tradingview.com/chart/?symbol=IDX:{d['kode']}" target="_blank" rel="noopener">Buka di TradingView ↗</a> · <a href="https://stockbit.com/symbol/{d['kode']}" target="_blank" rel="noopener">Buka di Stockbit ↗</a></p>
 <p><b>Rencana transaksi</b> (kalau masuk di harga sekarang)</p>
 <ul>
 <li>Harga {rp(harga)} · Stop loss <b>{rp(stop)}</b> ({stop_pct:+.1f}%) · Target <b>{rp(target)}</b> ({target_pct:+.1f}%)</li>
@@ -369,7 +369,19 @@ function buka(){var el=document.getElementById(location.hash.slice(1));
   if(el&&el.tagName==='DETAILS'){el.style.display='';el.open=true;el.scrollIntoView();}}
 window.addEventListener('hashchange',buka);buka();
 
-// ----- filter -----
+// ----- TradingView -----
+function muatTV(tombol){
+  var wadah=tombol.nextElementSibling;
+  wadah.style.height='480px';
+  wadah.innerHTML='<div class="tradingview-widget-container" style="height:100%;width:100%"><div class="tradingview-widget-container__widget" style="height:100%;width:100%"></div></div>';
+  var s=document.createElement('script');
+  s.src='https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js';
+  s.async=true;
+  s.innerHTML=JSON.stringify({autosize:true,symbol:'IDX:'+tombol.dataset.kode,interval:'D',timezone:'Asia/Jakarta',theme:'light',style:'1',locale:'id',allow_symbol_change:false});
+  wadah.firstChild.appendChild(s);
+  tombol.style.display='none';
+}
+document.querySelectorAll('button.tv').forEach(function(t){t.addEventListener('click',function(){muatTV(t);});});
 function ambilNilai(id){return document.getElementById(id).value;}
 function saring(){
   var cari=ambilNilai('f-cari').toUpperCase().split(/[ ,]+/).filter(function(k){return k;});
