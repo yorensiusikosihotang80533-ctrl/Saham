@@ -4,8 +4,8 @@ import numpy as np, pandas as pd
 import yfinance as yf, plotly.graph_objects as go
 
 # ================= PENGATURAN (boleh diubah) =================
-MODAL = 10_000_000   # modal lu dalam rupiah
-RISIKO = 1           # maksimal rugi per transaksi, % dari modal
+MODAL = 10_000_000   # angka awal di kotak modal (bisa diganti langsung di halaman)
+RISIKO = 1           # angka awal maksimal rugi per transaksi, % dari modal
 MIN_LIKUID = 5       # minimal nilai transaksi harian, miliar rupiah
 JUMLAH_TOP = 5       # berapa saham yang ditampilin di bagian "layak beli"
 BIAYA = 0.002        # perkiraan fee + selisih harga tiap transaksi (0,2%)
@@ -226,6 +226,10 @@ def fmt(v, persen=False):
     if v is None: return "tidak ada data"
     return f"{v*100:.1f}%" if persen else f"{v:.2f}"
 
+def data_lot(d):
+    """Atribut yang dibaca halaman buat ngitung ulang lot saat modal diganti."""
+    return f"data-harga='{d['harga']:.2f}' data-stop='{d['stop']}'"
+
 def bikin_grafik(d, pertama):
     df, m = d["df"], d["m"]
     c = df["Close"]
@@ -249,19 +253,16 @@ def bikin_grafik(d, pertama):
 
 def blok_detail(d, pertama, ihsg):
     m, f = d["m"], d["f"]
-    harga, stop, target, lot = d["harga"], d["stop"], d["target"], d["lot"]
+    harga, stop, target = d["harga"], d["stop"], d["target"]
     posisi = "PEGANG / BELI" if d["posisi"] == 1 else "DI LUAR / JUAL"
     ujian = "LULUS" if m["lulus"] else "GAGAL, sinyalnya kurang bisa dipercaya"
     teks_fun = "tidak cukup data" if d["fun"] is None else f"{d['fun']:.0f}/100"
     teks_ihsg = {True: "sehat", False: "lemah (skor dipotong 15)", None: "data tidak tersedia"}[ihsg]
     teks_vol = "akumulasi" if d["akumulasi"] else "distribusi"
     teks_likuid = "cukup likuid" if d["likuid"] else "⚠️ KURANG LIKUID, bisa susah dijual"
-    if lot > 0:
-        teks_lot = f"<b>{lot} lot</b> (sekitar {rp(lot * harga * 100)}), rugi sekitar {rp(lot * (harga - stop) * 100)} kalau kena stop loss"
-    else:
-        teks_lot = "<b>0 lot</b>, modal atau batas risikonya terlalu kecil buat saham ini"
     stop_pct = (stop / harga - 1) * 100
     target_pct = (target / harga - 1) * 100
+    atribut = data_lot(d)
     grafik = bikin_grafik(d, pertama)
     return f"""<details id="{d['kode']}">
 <summary><b>{d['kode']}</b> {e(f['nama'])} · {d['rekom']} · skor {d['akhir']:.0f}</summary>
@@ -269,7 +270,7 @@ def blok_detail(d, pertama, ihsg):
 <p><b>Rencana transaksi</b> (kalau masuk di harga sekarang)</p>
 <ul>
 <li>Harga {rp(harga)} · Stop loss <b>{rp(stop)}</b> ({stop_pct:+.1f}%) · Target <b>{rp(target)}</b> ({target_pct:+.1f}%)</li>
-<li>Maksimal beli: {teks_lot}</li>
+<li>Maksimal beli: <span data-mode='panjang' {atribut}>{d['lot']} lot</span></li>
 </ul>
 <p><b>Teknikal: {d['tek']:.0f}/100</b></p>
 <ul>
@@ -290,6 +291,10 @@ CSS = """
 body{font-family:system-ui,sans-serif;max-width:1000px;margin:0 auto;padding:16px;color:#1a1a1a;background:#fafafa;line-height:1.5}
 h1{font-size:1.5rem;margin-bottom:0} h2{font-size:1.15rem;margin-top:32px;border-bottom:2px solid #ddd;padding-bottom:4px}
 .info{color:#555;font-size:.9rem} .peringatan{background:#fff3cd;padding:8px 12px;border-radius:8px}
+.modal-box{background:#eef5ff;border:1px solid #b9d3f5;border-radius:8px;padding:12px;margin:16px 0}
+.modal-box label{display:inline-block;margin:4px 16px 4px 0;font-weight:600}
+.modal-box input{font-size:1rem;padding:6px 8px;border:1px solid #999;border-radius:6px;width:150px}
+.modal-box input#risiko{width:60px} #modal-teks{font-weight:700;color:#0b5cad}
 .kartu-wrap{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px}
 .kartu{background:#fff;border:1px solid #ddd;border-left:5px solid #2e9e4f;border-radius:8px;padding:12px}
 .kartu .kode{font-size:1.2rem;font-weight:700} .kartu .skor{float:right;color:#2e9e4f;font-weight:700}
@@ -307,6 +312,32 @@ document.querySelectorAll('details').forEach(function(d){d.addEventListener('tog
 function buka(){var el=document.getElementById(location.hash.slice(1));
   if(el&&el.tagName==='DETAILS'){el.open=true;el.scrollIntoView();}}
 window.addEventListener('hashchange',buka);buka();
+
+var kotakModal=document.getElementById('modal'), kotakRisiko=document.getElementById('risiko');
+function titik(x){return Math.round(x).toLocaleString('id-ID');}
+function hitung(){
+  var modal=parseFloat(kotakModal.value.replace(/[^0-9]/g,''))||0;
+  var risiko=parseFloat(kotakRisiko.value.replace(',','.'))||0;
+  document.getElementById('modal-teks').textContent='= Rp '+titik(modal)+', maks rugi Rp '+titik(modal*risiko/100)+' per transaksi';
+  try{localStorage.setItem('modal',modal);localStorage.setItem('risiko',risiko);}catch(err){}
+  document.querySelectorAll('[data-harga]').forEach(function(el){
+    var h=parseFloat(el.dataset.harga), s=parseFloat(el.dataset.stop), rugi=(h-s)*100, lot=0;
+    if(rugi>0){lot=Math.max(0,Math.min(Math.floor(modal*risiko/100/rugi),Math.floor(modal/(h*100))));}
+    if(el.dataset.mode==='panjang'){
+      el.innerHTML=lot>0
+        ? '<b>'+lot+' lot</b> (sekitar Rp '+titik(lot*h*100)+'), rugi sekitar Rp '+titik(lot*rugi)+' kalau kena stop loss'
+        : '<b>0 lot</b>, modal atau batas risikonya terlalu kecil buat saham ini';
+    } else { el.textContent=lot; }
+  });
+}
+try{
+  var m0=localStorage.getItem('modal'), r0=localStorage.getItem('risiko');
+  if(m0&&parseFloat(m0)>0){kotakModal.value=m0;}
+  if(r0&&parseFloat(r0)>0){kotakRisiko.value=r0;}
+}catch(err){}
+kotakModal.addEventListener('input',hitung);
+kotakRisiko.addEventListener('input',hitung);
+hitung();
 """
 
 def bikin_halaman(hasil, perubahan, tgl_pembanding, ihsg, gagal, tanggal_data):
@@ -326,6 +357,14 @@ def bikin_halaman(hasil, perubahan, tgl_pembanding, ihsg, gagal, tanggal_data):
     if gagal:
         b.append(f"<p class='info'>Gagal diambil: {e(', '.join(gagal))}</p>")
 
+    # --- Kotak modal ---
+    b.append("<div class='modal-box'>"
+             f"<label>Modal hari ini (Rp) <input id='modal' type='text' inputmode='numeric' value='{MODAL}'></label>"
+             f"<label>Maks rugi per transaksi (%) <input id='risiko' type='text' inputmode='decimal' value='{RISIKO}'></label>"
+             "<div id='modal-teks'></div>"
+             "<div class='info'>Maks lot di seluruh halaman langsung ngikutin angka ini. Angkanya cuma kesimpen di browser lu.</div>"
+             "</div>")
+
     # --- Top layak beli ---
     b.append("<h2>Top saham layak beli</h2>")
     top = [d for d in hasil if d["rekom"].startswith("🟢")][:JUMLAH_TOP]
@@ -336,7 +375,7 @@ def bikin_halaman(hasil, perubahan, tgl_pembanding, ihsg, gagal, tanggal_data):
                      f"<div class='kode'><a href='#{d['kode']}'>{d['kode']}</a></div>"
                      f"<small>{e(d['f']['nama'])}</small><br>"
                      f"Harga {rp(d['harga'])}<br>Stop loss {rp(d['stop'])}<br>Target {rp(d['target'])}<br>"
-                     f"Maks <b>{d['lot']} lot</b></div>")
+                     f"Maks <b><span {data_lot(d)}>{d['lot']}</span> lot</b></div>")
         b.append("</div>")
     else:
         b.append("<p>Hari ini gak ada saham yang skornya 70 ke atas. Gak beli apa-apa juga keputusan yang sah.</p>")
@@ -359,7 +398,8 @@ def bikin_halaman(hasil, perubahan, tgl_pembanding, ihsg, gagal, tanggal_data):
     for d in hasil:
         b.append(f"<tr><td><a href='#{d['kode']}'><b>{d['kode']}</b></a></td><td>{angka(d['harga'])}</td>"
                  f"<td>{d['akhir']:.0f}</td><td>{d['rekom']}</td><td>{'Beli' if d['posisi'] == 1 else 'Jual'}</td>"
-                 f"<td>{angka(d['stop'])}</td><td>{angka(d['target'])}</td><td>{d['lot']}</td><td>{d['rasio']:.1f}x</td></tr>")
+                 f"<td>{angka(d['stop'])}</td><td>{angka(d['target'])}</td>"
+                 f"<td {data_lot(d)}>{d['lot']}</td><td>{d['rasio']:.1f}x</td></tr>")
     b.append("</table></div>")
 
     # --- Detail ---
