@@ -1,7 +1,7 @@
 import html, json, os, sys, time
 from datetime import datetime, timezone, timedelta
 import numpy as np, pandas as pd
-import yfinance as yf, plotly.graph_objects as go
+import yfinance as yf
 
 # ================= PENGATURAN (boleh diubah) =================
 MODAL = 10_000_000   # angka awal di kotak modal (bisa diganti langsung di halaman)
@@ -17,6 +17,7 @@ AREA_BUFFER = 0.5    # stop loss ditaruh 0,5x gerak harian di bawah area demand
 TARGET_MAKS_ATR = 6  # target paling jauh 6x gerak harian dari harga masuk
 RR_MIN = 1.5         # untung banding rugi di bawah ini dianggap kurang layak
 PBV_MAKS = 50        # PBV di atas ini dianggap data rusak (biasanya laporan dalam dolar)
+GRAFIK_HARI = 250    # berapa hari bursa yang disimpan buat grafik
 BIAYA = 0.002        # perkiraan fee + selisih harga tiap transaksi (0,2%)
 STOP_ATR = 2         # cadangan kalau area demand gak ketemu: stop = harga - 2x gerak harian
 TARGET_ATR = 3       # cadangan kalau area supply gak ketemu: target = harga + 3x gerak harian
@@ -79,12 +80,10 @@ def ambil_fundamental(kode):
          "PER": angka("trailingPE"), "PBV": angka("priceToBook"),
          "ROE": angka("returnOnEquity"), "DER": angka("debtToEquity"),
          "Dividen": None, "Growth": angka("earningsGrowth")}
-    # kalau Yahoo gagal ngasih sebagian data, pakai simpanan terakhir yang berhasil
     lama = SIMPANAN_FUN.get(kode, {})
     for k in f:
         if f[k] is None and lama.get(k) is not None:
             f[k] = lama[k]
-    # buang angka yang jelas rusak
     if f["PBV"] is not None and (f["PBV"] <= 0 or f["PBV"] > PBV_MAKS):
         f["PBV"] = None
     if f["PER"] is not None and abs(f["PER"]) > 1000:
@@ -161,7 +160,7 @@ def titik_balik(seri, cari_terendah):
     batas = seri.rolling(w, center=True).min() if cari_terendah else seri.rolling(w, center=True).max()
     out, terakhir = [], -999
     for i in np.flatnonzero((seri == batas).to_numpy()):
-        if i - terakhir > AREA_JENDELA:          # hindari satu titik balik kehitung dobel
+        if i - terakhir > AREA_JENDELA:
             out.append((float(seri.iloc[i]), int(i)))
         terakhir = i
     return out
@@ -187,10 +186,8 @@ def cari_area(df, harga, a):
 
 def bikin_rencana(df, harga, a):
     area = cari_area(df, harga, a)
-    # demand = area terdekat yang ada di bawah harga atau yang lagi ditempati harga
     calon_d = [z for z in area if z["bawah"] <= harga]
     demand = max(calon_d, key=lambda z: z["atas"]) if calon_d else None
-    # supply = area terdekat yang benar-benar di atas harga DAN di atas area beli
     lantai = max(harga, demand["atas"]) if demand else harga
     calon_s = [z for z in area if z["bawah"] > lantai]
     supply = min(calon_s, key=lambda z: z["bawah"]) if calon_s else None
@@ -249,7 +246,7 @@ def kandidat(df):
         out.append((f"Breakout {n} hari + volume", posisi_dari_sinyal(tembus & ramai, jebol)))
     return out
 
-# ---------- BAGIAN "BELAJAR SENDIRI" ----------
+# ---------- BAGIAN "BELAJAR SENDIRI": GABUNGAN SEMUA STRATEGI ----------
 def hasil_harian(c, pos):
     p = pos.shift(1).fillna(0)
     return p * c.pct_change().fillna(0) - p.diff().abs().fillna(0) * BIAYA
@@ -261,32 +258,43 @@ def total(r):
     return float((1 + r).prod() - 1)
 
 def belajar(df):
+    """Bobot tiap strategi dari data belajar (70% awal), lalu gabungannya diuji di 30% akhir."""
     c = df["Close"]
     batas = int(len(df) * 0.7)
-    terbaik = None
+    tabel, daftar_pos = [], []
     for nama, pos in kandidat(df):
         r = hasil_harian(c, pos)
-        nilai = sharpe(r.iloc[:batas])
-        if terbaik is None or nilai > terbaik["sharpe_latih"]:
-            terbaik = {"nama": nama, "pos": pos, "sharpe_latih": nilai,
-                       "ret_uji": total(r.iloc[batas:]), "sharpe_uji": sharpe(r.iloc[batas:])}
-    terbaik["bh_uji"] = total(c.pct_change().fillna(0).iloc[batas:])
-    untung = terbaik["ret_uji"] > 0 and terbaik["sharpe_uji"] > 0
+        tabel.append({"nama": nama, "sharpe_latih": sharpe(r.iloc[:batas]),
+                      "ret_uji": total(r.iloc[batas:]), "posisi": int(pos.iloc[-1])})
+        daftar_pos.append(pos)
+    w = np.array([max(t["sharpe_latih"], 0.0) for t in tabel])
+    if w.sum() <= 0:
+        w = np.ones(len(tabel))
+    w = w / w.sum()
+    suara = pd.Series(0.0, index=c.index)
+    for t, bobot, pos in zip(tabel, w, daftar_pos):
+        t["bobot"] = float(bobot)
+        suara = suara + bobot * (2 * pos - 1)        # +1 kalau strategi itu lagi beli, -1 kalau lagi di luar
+    pos_gab = (suara > 0).astype(float)
+    r = hasil_harian(c, pos_gab)
+    m = {"pos": pos_gab, "suara": float(suara.iloc[-1]), "tabel": sorted(tabel, key=lambda t: t["bobot"], reverse=True),
+         "jumlah_beli": sum(t["posisi"] for t in tabel), "jumlah": len(tabel),
+         "ret_uji": total(r.iloc[batas:]), "sharpe_uji": sharpe(r.iloc[batas:]),
+         "bh_uji": total(c.pct_change().fillna(0).iloc[batas:]), "mulai_uji": df.index[batas]}
+    untung = m["ret_uji"] > 0 and m["sharpe_uji"] > 0
     if not untung:
-        terbaik["tingkat"] = "gagal"
-    elif terbaik["bh_uji"] > 0 and terbaik["ret_uji"] < 0.5 * terbaik["bh_uji"]:
-        terbaik["tingkat"] = "tipis"
+        m["tingkat"] = "gagal"
+    elif m["bh_uji"] > 0 and m["ret_uji"] < 0.5 * m["bh_uji"]:
+        m["tingkat"] = "tipis"
     else:
-        terbaik["tingkat"] = "lulus"
-    terbaik["lulus"] = terbaik["tingkat"] == "lulus"
-    terbaik["mulai_uji"] = df.index[batas]
-    return terbaik
+        m["tingkat"] = "lulus"
+    m["lulus"] = m["tingkat"] == "lulus"
+    return m
 
 # ---------- SKOR ----------
 def skor_teknikal(df, m, akumulasi, ihsg_sehat):
     c = df["Close"]
-    bobot = BOBOT_UJI[m["tingkat"]]
-    skor = 50 + (25 if m["pos"].iloc[-1] == 1 else -25) * bobot
+    skor = 50 + 25 * m["suara"] * BOBOT_UJI[m["tingkat"]]
     skor += 12 if c.iloc[-1] > c.rolling(200).mean().iloc[-1] else -12
     skor += 8 if c.iloc[-1] > c.iloc[-63] else -8
     skor += 5 if akumulasi else -5
@@ -338,7 +346,7 @@ def proses(kode, ihsg):
     likuid = nilai_harian >= MIN_LIKUID * 1e9
     d = {"kode": kode, "df": df, "m": m, "f": f, "tek": tek, "fun": fun, "akhir": akhir,
          "rekom": label(akhir) if likuid else LABEL[4],
-         "posisi": int(m["pos"].iloc[-1]), "harga": harga, "rasio": rasio, "akumulasi": akumulasi,
+         "posisi": int(m["suara"] > 0), "harga": harga, "rasio": rasio, "akumulasi": akumulasi,
          "nilai_harian": nilai_harian, "likuid": likuid,
          "macd": info_macd(df["Close"]), "pakai_macd": round(akhir) > MACD_MIN_SKOR}
     d.update(bikin_rencana(df, harga, a))
@@ -352,10 +360,44 @@ def cari_perubahan(hasil, pembanding):
         if not lama:
             continue
         if lama["posisi"] != d["posisi"]:
-            out.append((d["kode"], "sinyal strategi berubah jadi " + ("BELI" if d["posisi"] == 1 else "JUAL")))
+            out.append((d["kode"], "sinyal gabungan berubah jadi " + ("BELI" if d["posisi"] == 1 else "JUAL")))
         if lama["rekom"] != d["rekom"]:
             out.append((d["kode"], f"{lama['rekom']} → {d['rekom']} (skor {lama['skor']} → {round(d['akhir'])})"))
     return out
+
+# ---------- DATA GRAFIK (ringkas, digambar di browser saat detail dibuka) ----------
+def daftar(seri, digit=0):
+    out = []
+    for v in seri:
+        if pd.isna(v):
+            out.append(None)
+        elif digit == 0:
+            out.append(int(round(float(v))))
+        else:
+            out.append(round(float(v), digit))
+    return out
+
+def data_grafik(d):
+    df, m = d["df"], d["m"]
+    k = df.iloc[-GRAFIK_HARI:]
+    c = df["Close"]
+    ubah = m["pos"].diff().reindex(k.index).to_numpy()
+    g = {"t": [x.strftime("%Y-%m-%d") for x in k.index],
+         "o": daftar(k["Open"]), "h": daftar(k["High"]), "l": daftar(k["Low"]), "c": daftar(k["Close"]),
+         "m50": daftar(c.rolling(50).mean().reindex(k.index), 1),
+         "m200": daftar(c.rolling(200).mean().reindex(k.index), 1),
+         "b": [int(i) for i in np.flatnonzero(ubah == 1)],
+         "j": [int(i) for i in np.flatnonzero(ubah == -1)],
+         "uji": m["mulai_uji"].strftime("%Y-%m-%d") if m["mulai_uji"] >= k.index[0] else None,
+         "dm": [round(d["demand"]["bawah"], 1), round(d["demand"]["atas"], 1)] if d["demand"] else None,
+         "sp": [round(d["supply"]["bawah"], 1), round(d["supply"]["atas"], 1)] if d["supply"] else None,
+         "st": d["stop"], "tg": d["target"]}
+    if d["pakai_macd"]:
+        mc = d["macd"]
+        g["mg"] = daftar(mc["garis"].iloc[-120:], 2)
+        g["ms"] = daftar(mc["sinyal"].iloc[-120:], 2)
+        g["mh"] = daftar(mc["hist"].iloc[-120:], 2)
+    return g
 
 # ---------- BIKIN HALAMAN ----------
 def e(x):
@@ -375,59 +417,12 @@ def fmt_der(v):
     return "tidak ada data" if v is None else f"{v / 100:.2f}x"
 
 def data_lot(d):
-    """Atribut yang dibaca halaman buat ngitung ulang lot saat modal diganti."""
     return f"data-harga='{d['masuk']:.2f}' data-stop='{d['stop']}'"
 
 def teks_area_beli(d):
     if not d["demand"]:
         return "-"
     return f"{angka(d['beli_bawah'])} - {angka(d['beli_atas'])}"
-
-def bikin_grafik(d, pertama):
-    df, m = d["df"], d["m"]
-    c = df["Close"]
-    lihat = c.iloc[-500:]
-    k = df.iloc[-500:]
-    fig = go.Figure()
-    fig.add_candlestick(x=k.index, open=k["Open"], high=k["High"], low=k["Low"], close=k["Close"], name="Harga",
-                        increasing_line_color="#2e9e4f", decreasing_line_color="#d64545")
-    fig.add_scatter(x=lihat.index, y=c.rolling(50).mean().reindex(lihat.index), name="MA50", line=dict(dash="dot"))
-    fig.add_scatter(x=lihat.index, y=c.rolling(200).mean().reindex(lihat.index), name="MA200", line=dict(dash="dot"))
-    ubah = m["pos"].diff().reindex(lihat.index)
-    beli, jual = lihat[ubah == 1], lihat[ubah == -1]
-    fig.add_scatter(x=beli.index, y=beli, mode="markers", name="Sinyal beli",
-                    marker=dict(symbol="triangle-up", size=12, color="green"))
-    fig.add_scatter(x=jual.index, y=jual, mode="markers", name="Sinyal jual",
-                    marker=dict(symbol="triangle-down", size=12, color="red"))
-    fig.add_vline(x=m["mulai_uji"], line_dash="dash", line_color="gray")
-    if d["demand"]:
-        fig.add_hrect(y0=d["demand"]["bawah"], y1=d["demand"]["atas"], fillcolor="green", opacity=0.15, line_width=0)
-    if d["supply"]:
-        fig.add_hrect(y0=d["supply"]["bawah"], y1=d["supply"]["atas"], fillcolor="red", opacity=0.15, line_width=0)
-    fig.add_hline(y=d["stop"], line_dash="dot", line_color="red", annotation_text="Stop loss")
-    fig.add_hline(y=d["target"], line_dash="dot", line_color="green", annotation_text="Target")
-    fig.update_layout(height=460, margin=dict(l=10, r=10, t=20, b=10), legend=dict(orientation="h"),
-                      xaxis_rangeslider_visible=False)
-    dekat = df.iloc[-120:]
-    bawah = min(float(dekat["Low"].min()), d["stop"]) * 0.97
-    atas = max(float(dekat["High"].max()), d["target"]) * 1.03
-    fig.update_xaxes(range=[dekat.index[0], dekat.index[-1]], rangebreaks=[dict(bounds=["sat", "mon"])])
-    fig.update_yaxes(range=[bawah, atas])
-    return fig.to_html(full_html=False, include_plotlyjs="cdn" if pertama else False,
-                       config={"responsive": True, "displayModeBar": False})
-
-def bikin_grafik_macd(d):
-    mc = d["macd"]
-    hist = mc["hist"].iloc[-120:]
-    warna = ["#2e9e4f" if v >= 0 else "#d64545" for v in hist]
-    fig = go.Figure()
-    fig.add_bar(x=hist.index, y=hist, name="Histogram", marker_color=warna)
-    fig.add_scatter(x=hist.index, y=mc["garis"].reindex(hist.index), name="MACD", line=dict(color="#0b5cad"))
-    fig.add_scatter(x=hist.index, y=mc["sinyal"].reindex(hist.index), name="Sinyal", line=dict(color="#e08a00"))
-    fig.update_layout(height=240, margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h"))
-    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
-    return fig.to_html(full_html=False, include_plotlyjs=False,
-                       config={"responsive": True, "displayModeBar": False})
 
 def teks_macd_panjang(mc):
     arah = TEKS_MACD[mc["status"]]
@@ -440,10 +435,19 @@ def kekuatan(z):
     lemah = " (area lemah)" if z["sentuh"] < AREA_MIN_SENTUH else ""
     return f"disentuh {z['sentuh']} kali setahun terakhir, terakhir {z['lalu']} hari bursa lalu{lemah}"
 
-def blok_detail(d, pertama, ihsg):
+def tabel_strategi(m):
+    b = ["<div class='geser'><table class='kecil'><tr><th>Strategi</th><th>Nilai belajar</th><th>Bobot suara</th>"
+         "<th>Hasil ujian</th><th>Posisi sekarang</th></tr>"]
+    for t in m["tabel"]:
+        b.append(f"<tr><td>{e(t['nama'])}</td><td>{t['sharpe_latih']:+.2f}</td><td>{t['bobot'] * 100:.0f}%</td>"
+                 f"<td>{t['ret_uji'] * 100:+.1f}%</td><td>{'Beli' if t['posisi'] == 1 else 'Di luar'}</td></tr>")
+    b.append("</table></div>")
+    return "".join(b)
+
+def blok_detail(d, ihsg):
     m, f = d["m"], d["f"]
     harga, masuk, stop, target = d["harga"], d["masuk"], d["stop"], d["target"]
-    posisi = "PEGANG / BELI" if d["posisi"] == 1 else "DI LUAR / JUAL"
+    arah = "BELI" if d["posisi"] == 1 else "JUAL / DI LUAR"
     ujian = TEKS_UJI[m["tingkat"]]
     teks_fun = "tidak cukup data" if d["fun"] is None else f"{d['fun']:.0f}/100"
     teks_ihsg = {True: "sehat", False: "lemah (skor dipotong 15)", None: "data tidak tersedia"}[ihsg]
@@ -467,13 +471,13 @@ def blok_detail(d, pertama, ihsg):
         asal_target = "rumus ATR, karena gak ada area supply di atas harga"
     layak = "layak" if d["rr"] >= RR_MIN else f"kurang layak, di bawah {RR_MIN:g}"
     atribut = data_lot(d)
-    grafik = bikin_grafik(d, pertama)
-    grafik_macd = bikin_grafik_macd(d) if d["pakai_macd"] else ""
+    wadah_macd = f"<div id='m-{d['kode']}'></div>" if d["pakai_macd"] else ""
     baris_macd = "<li>" + teks_macd_panjang(d["macd"]) + "</li>" if d["pakai_macd"] else ""
+    strategi = tabel_strategi(m)
     return f"""<details class="blok" id="{d['kode']}">
 <summary><b>{d['kode']}</b> {e(f['nama'])} · {d['rekom']} · skor {d['akhir']:.0f}</summary>
-{grafik}
-{grafik_macd}
+<div id="g-{d['kode']}"></div>
+{wadah_macd}
 <button class="tv" type="button" data-kode="{d['kode']}">Tampilkan grafik TradingView</button><div></div>
 <p class="info">Sektor: {e(f['sektor'])} · <a href="https://www.tradingview.com/chart/?symbol=IDX:{d['kode']}" target="_blank" rel="noopener">Buka di TradingView ↗</a> · <a href="https://stockbit.com/symbol/{d['kode']}" target="_blank" rel="noopener">Buka di Stockbit ↗</a></p>
 <p><b>Rencana transaksi</b></p>
@@ -487,13 +491,15 @@ def blok_detail(d, pertama, ihsg):
 </ul>
 <p><b>Teknikal: {d['tek']:.0f}/100</b></p>
 <ul>
-<li>Strategi paling cocok: <b>{e(m['nama'])}</b>, posisi sekarang <b>{posisi}</b></li>
-<li>Ujian sejak {m['mulai_uji']:%b %Y} (kanan garis abu-abu): strategi {m['ret_uji']*100:+.1f}% vs beli-diamkan {m['bh_uji']*100:+.1f}% → <b>{ujian}</b></li>
+<li>Suara gabungan {m['jumlah']} strategi: <b>{m['suara']:+.2f}</b> (skala -1 sampai +1), {m['jumlah_beli']} dari {m['jumlah']} strategi lagi posisi beli → <b>{arah}</b></li>
+<li>Ujian gabungan sejak {m['mulai_uji']:%b %Y}: {m['ret_uji']*100:+.1f}% vs beli-diamkan {m['bh_uji']*100:+.1f}% → <b>{ujian}</b></li>
 {baris_macd}
 <li>Kondisi IHSG: {teks_ihsg}</li>
 <li>Volume terakhir {d['rasio']:.1f}x rata-rata 20 hari, arah {teks_vol}</li>
 <li>Nilai transaksi harian rata-rata {rp(d['nilai_harian'])} → {teks_likuid}</li>
 </ul>
+<p class="info">Rincian tiap strategi. Bobot suara dihitung dari nilai belajar, strategi yang nilai belajarnya negatif gak dapat suara.</p>
+{strategi}
 <p><b>Fundamental: {teks_fun}</b></p>
 <ul>
 <li>PER {fmt(f['PER'])} · PBV {fmt(f['PBV'])} · ROE {fmt(f['ROE'], True)}</li>
@@ -515,22 +521,68 @@ h1{font-size:1.5rem;margin-bottom:0} h2{font-size:1.15rem;margin-top:32px;border
 .filter label{font-size:.9rem} #f-jumlah{width:100%;font-size:.9rem;color:#555}
 .kartu-wrap{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:12px}
 .kartu{background:#fff;border:1px solid #ddd;border-left:5px solid #2e9e4f;border-radius:8px;padding:12px}
+.kartu.lemah{border-left-color:#e08a00}
 .kartu .kode{font-size:1.2rem;font-weight:700} .kartu .skor{float:right;color:#2e9e4f;font-weight:700}
 .kartu small{color:#555}
 .geser{overflow-x:auto} table{border-collapse:collapse;width:100%;background:#fff;font-size:.9rem}
 th,td{padding:6px 10px;border-bottom:1px solid #e5e5e5;text-align:right;white-space:nowrap}
-th:first-child,td:first-child,th:nth-child(4),td:nth-child(4),th:nth-child(6),td:nth-child(6),th:nth-child(12),td:nth-child(12),th:last-child,td:last-child{text-align:left}
-th{background:#f0f0f0;cursor:pointer;user-select:none}
+th{background:#f0f0f0} th:first-child,td:first-child{text-align:left}
+#tabel-peringkat th:nth-child(4),#tabel-peringkat td:nth-child(4),#tabel-peringkat th:nth-child(5),#tabel-peringkat td:nth-child(5),
+#tabel-peringkat th:nth-child(6),#tabel-peringkat td:nth-child(6),#tabel-peringkat th:nth-child(12),#tabel-peringkat td:nth-child(12),
+#tabel-peringkat th:last-child,#tabel-peringkat td:last-child{text-align:left}
+#tabel-peringkat th{cursor:pointer;user-select:none}
+table.kecil{font-size:.85rem;margin:6px 0 12px}
 details{background:#fff;border:1px solid #ddd;border-radius:8px;padding:10px 14px;margin:8px 0}
 button.tv{font-size:.9rem;padding:6px 12px;border:1px solid #999;border-radius:6px;background:#fff;cursor:pointer;margin:8px 0}
 summary{cursor:pointer} a{color:#0b5cad;text-decoration:none} footer{margin-top:32px;color:#777;font-size:.8rem}
 """
 
 JS = """
-function ukurUlang(){window.dispatchEvent(new Event('resize'));}
-document.querySelectorAll('details').forEach(function(d){d.addEventListener('toggle',ukurUlang);});
+// ----- grafik: digambar saat detail saham dibuka -----
+function gambar(kode){
+  var d=DATA[kode];
+  if(!d||d.sudah||typeof Plotly==='undefined'){return;}
+  d.sudah=true;
+  var n=d.t.length, awal=Math.max(0,n-120);
+  var jejak=[
+    {type:'candlestick',x:d.t,open:d.o,high:d.h,low:d.l,close:d.c,name:'Harga',
+     increasing:{line:{color:'#2e9e4f'}},decreasing:{line:{color:'#d64545'}}},
+    {type:'scatter',mode:'lines',x:d.t,y:d.m50,name:'MA50',line:{dash:'dot'}},
+    {type:'scatter',mode:'lines',x:d.t,y:d.m200,name:'MA200',line:{dash:'dot'}},
+    {type:'scatter',mode:'markers',name:'Sinyal beli',x:d.b.map(function(i){return d.t[i];}),y:d.b.map(function(i){return d.c[i];}),
+     marker:{symbol:'triangle-up',size:12,color:'green'}},
+    {type:'scatter',mode:'markers',name:'Sinyal jual',x:d.j.map(function(i){return d.t[i];}),y:d.j.map(function(i){return d.c[i];}),
+     marker:{symbol:'triangle-down',size:12,color:'red'}}
+  ];
+  var bentuk=[];
+  function pita(z,warna){if(z){bentuk.push({type:'rect',xref:'paper',x0:0,x1:1,yref:'y',y0:z[0],y1:z[1],fillcolor:warna,opacity:0.15,line:{width:0}});}}
+  function garis(y,warna){bentuk.push({type:'line',xref:'paper',x0:0,x1:1,yref:'y',y0:y,y1:y,line:{color:warna,dash:'dot'}});}
+  pita(d.dm,'green'); pita(d.sp,'red'); garis(d.st,'red'); garis(d.tg,'green');
+  if(d.uji){bentuk.push({type:'line',xref:'x',x0:d.uji,x1:d.uji,yref:'paper',y0:0,y1:1,line:{color:'gray',dash:'dash'}});}
+  var bawah=Math.min.apply(null,d.l.slice(awal).concat([d.st]))*0.97;
+  var atas=Math.max.apply(null,d.h.slice(awal).concat([d.tg]))*1.03;
+  Plotly.newPlot('g-'+kode,jejak,{height:460,margin:{l:50,r:10,t:20,b:30},legend:{orientation:'h'},shapes:bentuk,
+    annotations:[
+      {xref:'paper',x:1,yref:'y',y:d.st,text:'Stop loss',showarrow:false,xanchor:'right',yanchor:'top'},
+      {xref:'paper',x:1,yref:'y',y:d.tg,text:'Target',showarrow:false,xanchor:'right',yanchor:'bottom'}],
+    xaxis:{rangeslider:{visible:false},range:[d.t[awal],d.t[n-1]],rangebreaks:[{bounds:['sat','mon']}]},
+    yaxis:{range:[bawah,atas]}},{responsive:true,displayModeBar:false});
+  if(d.mg){
+    var tm=d.t.slice(n-d.mg.length);
+    var warna=d.mh.map(function(v){return v>=0?'#2e9e4f':'#d64545';});
+    Plotly.newPlot('m-'+kode,[
+      {type:'bar',x:tm,y:d.mh,name:'Histogram',marker:{color:warna}},
+      {type:'scatter',mode:'lines',x:tm,y:d.mg,name:'MACD',line:{color:'#0b5cad'}},
+      {type:'scatter',mode:'lines',x:tm,y:d.ms,name:'Sinyal',line:{color:'#e08a00'}}],
+      {height:240,margin:{l:50,r:10,t:10,b:30},legend:{orientation:'h'},xaxis:{rangebreaks:[{bounds:['sat','mon']}]}},
+      {responsive:true,displayModeBar:false});
+  }
+}
+document.querySelectorAll('details.blok').forEach(function(el){
+  el.addEventListener('toggle',function(){if(el.open){gambar(el.id);}});
+});
 function buka(){var el=document.getElementById(location.hash.slice(1));
-  if(el&&el.tagName==='DETAILS'){el.style.display='';el.open=true;el.scrollIntoView();}}
+  if(el&&el.tagName==='DETAILS'){el.style.display='';el.open=true;gambar(el.id);el.scrollIntoView();}}
 window.addEventListener('hashchange',buka);buka();
 
 // ----- TradingView -----
@@ -649,7 +701,8 @@ def bikin_halaman(hasil, perubahan, tgl_pembanding, ihsg, gagal, tanggal_data):
     b = []
     b.append("<!doctype html><html lang='id'><head><meta charset='utf-8'>")
     b.append("<meta name='viewport' content='width=device-width,initial-scale=1'>")
-    b.append("<title>Ringkasan Saham Harian</title><style>" + CSS + "</style></head><body>")
+    b.append("<title>Ringkasan Saham Harian</title><style>" + CSS + "</style>")
+    b.append("<script src='https://cdn.plot.ly/plotly-2.35.2.min.js' charset='utf-8'></script></head><body>")
     b.append("<h1>📈 Ringkasan Saham Harian</h1>")
     b.append(f"<p class='info'>Data bursa per {e(tanggal_data)} · diperbarui {wib:%d %b %Y %H:%M} WIB · {len(hasil)} saham</p>")
     if ihsg is True:
@@ -661,7 +714,6 @@ def bikin_halaman(hasil, perubahan, tgl_pembanding, ihsg, gagal, tanggal_data):
     if gagal:
         b.append(f"<p class='info'>Gagal diambil: {e(', '.join(gagal))}</p>")
 
-    # --- Kotak modal ---
     b.append("<div class='modal-box'>"
              f"<label>Modal hari ini (Rp) <input id='modal' type='text' inputmode='numeric' value='{MODAL}'></label>"
              f"<label>Maks rugi per transaksi (%) <input id='risiko' type='text' inputmode='decimal' value='{RISIKO}'></label>"
@@ -673,16 +725,20 @@ def bikin_halaman(hasil, perubahan, tgl_pembanding, ihsg, gagal, tanggal_data):
     b.append("<h2>Top saham layak beli</h2>")
     top = [d for d in hasil if d["rekom"] == LABEL[0]][:JUMLAH_TOP]
     if top:
+        b.append(f"<p class='info'>Kartu bergaris oranye = skornya bagus tapi untung banding ruginya di bawah {RR_MIN:g}.</p>")
         b.append("<div class='kartu-wrap'>")
         for d in top:
+            lemah = d["rr"] < RR_MIN
             macd_kartu = "<br>MACD " + TEKS_MACD[d["macd"]["status"]] if d["pakai_macd"] else ""
             beli = f"Area beli Rp {teks_area_beli(d)}<br>" if d["demand"] else ""
-            b.append(f"<div class='kartu'><span class='skor'>{d['akhir']:.0f}</span>"
+            tanda = "⚠️ " if lemah else ""
+            b.append(f"<div class='kartu{' lemah' if lemah else ''}'><span class='skor'>{d['akhir']:.0f}</span>"
                      f"<div class='kode'><a href='#{d['kode']}'>{d['kode']}</a></div>"
                      f"<small>{e(d['f']['nama'])}</small><br>"
                      f"Harga {rp(d['harga'])}<br>{beli}{TEKS_AREA[d['posisi_area']]}<br>"
                      f"Stop loss {rp(d['stop'])}<br>Target {rp(d['target'])}<br>"
-                     f"Untung banding rugi {d['rr']:.1f} : 1<br>"
+                     f"{tanda}Untung banding rugi {d['rr']:.1f} : 1<br>"
+                     f"Suara strategi {d['m']['jumlah_beli']}/{d['m']['jumlah']} beli<br>"
                      f"Maks <b><span {data_lot(d)}>{d['lot']}</span> lot</b>{macd_kartu}</div>")
         b.append("</div>")
     else:
@@ -703,7 +759,7 @@ def bikin_halaman(hasil, perubahan, tgl_pembanding, ihsg, gagal, tanggal_data):
     # --- Peringkat + filter ---
     b.append("<h2>Peringkat lengkap</h2>")
     b.append(bikin_filter(hasil))
-    b.append(f"<p class='info'>Klik judul kolom buat ngurutin. U:R = untung banding rugi. "
+    b.append(f"<p class='info'>Klik judul kolom buat ngurutin. U:R = untung banding rugi. Sinyal = arah suara gabungan dan berapa strategi yang lagi beli. "
              f"Kolom MACD cuma keisi buat saham dengan skor di atas {MACD_MIN_SKOR}.</p>")
     b.append("<div class='geser'><table id='tabel-peringkat'><tr><th>Kode</th><th>Harga</th><th>Skor</th>"
              "<th>Rekomendasi</th><th>Sinyal</th><th>Area beli</th><th>Stop loss</th><th>Target</th><th>U:R</th>"
@@ -719,7 +775,8 @@ def bikin_halaman(hasil, perubahan, tgl_pembanding, ihsg, gagal, tanggal_data):
                  f"data-sinyal='{sinyal}' data-lulus='{lulus}' data-sektor='{sektor}' data-macd='{kode_macd}' "
                  f"data-area='{d['posisi_area']}' data-rr='{d['rr']:.2f}'>"
                  f"<td><a href='#{d['kode']}'><b>{d['kode']}</b></a></td><td>{angka(d['harga'])}</td>"
-                 f"<td>{d['akhir']:.0f}</td><td>{d['rekom']}</td><td>{sinyal}</td>"
+                 f"<td>{d['akhir']:.0f}</td><td>{d['rekom']}</td>"
+                 f"<td>{sinyal} {d['m']['jumlah_beli']}/{d['m']['jumlah']}</td>"
                  f"<td>{ikon_area[d['posisi_area']]}{teks_area_beli(d)}</td>"
                  f"<td>{angka(d['stop'])}</td><td>{angka(d['target'])}</td><td>{d['rr']:.1f}</td>"
                  f"<td {data_lot(d)}>{d['lot']}</td><td>{d['rasio']:.1f}x</td>"
@@ -729,11 +786,13 @@ def bikin_halaman(hasil, perubahan, tgl_pembanding, ihsg, gagal, tanggal_data):
     # --- Detail ---
     b.append("<h2>Detail per saham</h2><p class='info'>Klik buat buka grafik dan penjelasannya. Pita hijau di grafik = area demand, "
              "pita merah = area supply. Bagian ini ikut filter di atas.</p>")
-    for i, d in enumerate(hasil):
-        b.append(blok_detail(d, i == 0, ihsg))
+    for d in hasil:
+        b.append(blok_detail(d, ihsg))
 
     b.append("<footer>Bukan saran investasi. Performa masa lalu tidak menjamin hasil ke depan. "
              "Data dari Yahoo Finance, bisa telat atau tidak lengkap.</footer>")
+    data = {d["kode"]: data_grafik(d) for d in hasil}
+    b.append("<script>var DATA=" + json.dumps(data, separators=(",", ":")) + ";</script>")
     b.append("<script>" + JS.replace("RR_MIN_NILAI", str(RR_MIN)) + "</script></body></html>")
     return "\n".join(b)
 
@@ -747,10 +806,10 @@ def utama():
         except Exception:
             pass
 
-    daftar = baca_daftar()
+    daftar_kode = baca_daftar()
     ihsg = cek_ihsg()
     hasil, gagal = [], []
-    for kode in daftar:
+    for kode in daftar_kode:
         print("Analisa", kode)
         d = proses(kode, ihsg)
         if d is None:
