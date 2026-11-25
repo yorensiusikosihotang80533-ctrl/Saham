@@ -439,12 +439,28 @@ def kekuatan(z):
     return f"disentuh {z['sentuh']} kali setahun terakhir, terakhir {z['lalu']} hari bursa lalu{lemah}"
 
 def tabel_strategi(m):
-    b = ["<div class='geser'><table class='kecil'><tr><th>Strategi</th><th>Nilai belajar</th><th>Bobot suara</th>"
-         "<th>Hasil ujian</th><th>Posisi sekarang</th></tr>"]
-    for t in m["tabel"]:
-        b.append(f"<tr><td>{e(t['nama'])}</td><td>{t['sharpe_latih']:+.2f}</td><td>{t['bobot'] * 100:.0f}%</td>"
-                 f"<td>{t['ret_uji'] * 100:+.1f}%</td><td>{'Beli' if t['posisi'] == 1 else 'Di luar'}</td></tr>")
-    b.append("</table></div>")
+    """Ringkasan suara berbobot + tabel strategi yang berpengaruh; yang bobotnya 0% dilipat."""
+    beli = sum(t["bobot"] for t in m["tabel"] if t["posisi"] == 1) * 100
+    luar = sum(t["bobot"] for t in m["tabel"] if t["posisi"] != 1) * 100
+    kesimpulan = "condong BELI" if m["suara"] > 0 else "condong JUAL / di luar"
+
+    def baris(t):
+        return (f"<tr><td>{e(t['nama'])}</td><td>{t['sharpe_latih']:+.2f}</td><td>{t['bobot'] * 100:.0f}%</td>"
+                f"<td>{t['ret_uji'] * 100:+.1f}%</td><td>{'Beli' if t['posisi'] == 1 else 'Di luar'}</td></tr>")
+
+    kepala = ("<table class='kecil'><tr><th>Strategi</th><th>Skor latihan</th><th>Pengaruh</th>"
+              "<th>Hasil periode uji</th><th>Sekarang</th></tr>")
+    aktif = [t for t in m["tabel"] if t["bobot"] > 0]
+    diabaikan = [t for t in m["tabel"] if t["bobot"] <= 0]
+    b = [f"<p class='info'>Suara berbobot: <b>{beli:.0f}% beli</b> vs <b>{luar:.0f}% di luar</b> → <b>{kesimpulan}</b></p>",
+         "<div class='geser'>", kepala, "".join(baris(t) for t in aktif), "</table></div>"]
+    if diabaikan:
+        b.append(f"<details><summary>{len(diabaikan)} strategi diabaikan (pengaruh 0%, skor latihannya nol atau negatif)</summary>"
+                 f"<div class='geser'>{kepala}{''.join(baris(t) for t in diabaikan)}</table></div></details>")
+    b.append("<p class='info'><b>Cara baca:</b> <i>Skor latihan</i> = seberapa konsisten strategi untung di 70% data awal. "
+             "<i>Pengaruh</i> = besar suaranya, ditentukan dari skor latihan. <i>Hasil periode uji</i> = return di 30% data terakhir, "
+             "yang tidak dipakai buat belajar. Suara dijumlahkan: kalau yang bilang beli lebih berat dari yang bilang di luar, sinyalnya beli. "
+             "Jumlah strategi yang bilang beli (mis. 6/13) bisa beda dari hasil akhir karena suaranya berbobot.</p>")
     return "".join(b)
 
 def blok_detail(d, ihsg):
