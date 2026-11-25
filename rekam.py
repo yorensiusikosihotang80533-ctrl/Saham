@@ -234,7 +234,8 @@ def utama():
         c = float(sampai["Close"].iloc[-1])
         a = float(atr(sampai).iloc[-1])
         rekam.append({"kode": kode, "tgl_sinyal": teks_sinyal, "rekom": s["rekom"], "skor": int(s["skor"]),
-                      "harga_sinyal": c, "stop": int(s.get("stop") or bulatkan(c - STOP_ATR * a)),
+                        "harga_sinyal": c, "stop": int(s.get("stop") or bulatkan(c - STOP_ATR * a)),
+                      "target": int(s.get("target") or bulatkan(c + TARGET_ATR * a)),
                       "target": int(s.get("target") or bulatkan(c + TARGET_ATR * a)),
                       "status": "menunggu"})
         baru += 1
