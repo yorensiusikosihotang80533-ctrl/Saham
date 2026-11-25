@@ -26,7 +26,7 @@ def ambil_harga(kode):
             df = yf.Ticker(kode + ".JK").history(period="5y", auto_adjust=True)
             if df is not None and len(df) >= 300:
                 df.index = pd.to_datetime(df.index).tz_localize(None)
-                return df[["High", "Low", "Close", "Volume"]].dropna()
+                return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
         except Exception:
             pass
         time.sleep(3)
@@ -254,7 +254,9 @@ def bikin_grafik(d, pertama):
     c = df["Close"]
     lihat = c.iloc[-500:]
     fig = go.Figure()
-    fig.add_scatter(x=lihat.index, y=lihat, name="Harga")
+    k = df.iloc[-500:]
+    fig.add_candlestick(x=k.index, open=k["Open"], high=k["High"], low=k["Low"], close=k["Close"], name="Harga",
+                        increasing_line_color="#2e9e4f", decreasing_line_color="#d64545")
     fig.add_scatter(x=lihat.index, y=c.rolling(50).mean().reindex(lihat.index), name="MA50", line=dict(dash="dot"))
     fig.add_scatter(x=lihat.index, y=c.rolling(200).mean().reindex(lihat.index), name="MA200", line=dict(dash="dot"))
     ubah = m["pos"].diff().reindex(lihat.index)
@@ -266,7 +268,13 @@ def bikin_grafik(d, pertama):
     fig.add_vline(x=m["mulai_uji"], line_dash="dash", line_color="gray")
     fig.add_hline(y=d["stop"], line_dash="dot", line_color="red", annotation_text="Stop loss")
     fig.add_hline(y=d["target"], line_dash="dot", line_color="green", annotation_text="Target")
-    fig.update_layout(height=420, margin=dict(l=10, r=10, t=20, b=10), legend=dict(orientation="h"))
+    fig.update_layout(height=460, margin=dict(l=10, r=10, t=20, b=10), legend=dict(orientation="h"),
+                      xaxis_rangeslider_visible=False)
+    dekat = df.iloc[-120:]
+    bawah = min(float(dekat["Low"].min()), d["stop"]) * 0.97
+    atas = max(float(dekat["High"].max()), d["target"]) * 1.03
+    fig.update_xaxes(range=[dekat.index[0], dekat.index[-1]], rangebreaks=[dict(bounds=["sat", "mon"])])
+    fig.update_yaxes(range=[bawah, atas])
     return fig.to_html(full_html=False, include_plotlyjs="cdn" if pertama else False,
                        config={"responsive": True, "displayModeBar": False})
 
@@ -308,7 +316,7 @@ def blok_detail(d, pertama, ihsg):
 <summary><b>{d['kode']}</b> {e(f['nama'])} · {d['rekom']} · skor {d['akhir']:.0f}</summary>
 {grafik}
 {grafik_macd}
-<p class="info">Sektor: {e(f['sektor'])}</p>
+<p class="info">Sektor: {e(f['sektor'])} · <a href="https://www.tradingview.com/chart/?symbol=IDX:{d['kode']}" target="_blank" rel="noopener">Buka di TradingView ↗</a> · <a href="https://stockbit.com/symbol/{d['kode']}" target="_blank" rel="noopener">Buka di Stockbit ↗</a></p>
 <p><b>Rencana transaksi</b> (kalau masuk di harga sekarang)</p>
 <ul>
 <li>Harga {rp(harga)} · Stop loss <b>{rp(stop)}</b> ({stop_pct:+.1f}%) · Target <b>{rp(target)}</b> ({target_pct:+.1f}%)</li>
