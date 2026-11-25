@@ -14,6 +14,8 @@ TARGET_ATR = 3       # target    = harga + 3x gerak harian rata-rata
 VOLUME_RAMAI = 1.5   # volume disebut ramai kalau 1,5x rata-rata 20 hari
 # =============================================================
 
+LABEL = ["🟢 Layak beli", "🟡 Pantau / cicil", "⚪ Tunggu", "🔴 Hindari dulu", "⚫ Kurang likuid"]
+
 # ---------- AMBIL DATA ----------
 def ambil_harga(kode):
     for _ in range(3):
@@ -35,7 +37,7 @@ def ambil_fundamental(kode):
     def angka(k):
         v = info.get(k)
         return float(v) if isinstance(v, (int, float)) and np.isfinite(v) else None
-    return {"nama": info.get("shortName") or kode,
+    return {"nama": info.get("shortName") or kode, "sektor": info.get("sector") or "Lainnya",
             "PER": angka("trailingPE"), "PBV": angka("priceToBook"),
             "ROE": angka("returnOnEquity"), "DER": angka("debtToEquity"),
             "Dividen": angka("trailingAnnualDividendYield"), "Growth": angka("earningsGrowth")}
@@ -165,10 +167,10 @@ def skor_fundamental(f):
     return float(np.mean(s)) if len(s) >= 3 else None
 
 def label(skor):
-    if skor >= 70: return "🟢 Layak beli"
-    if skor >= 55: return "🟡 Pantau / cicil"
-    if skor >= 40: return "⚪ Tunggu"
-    return "🔴 Hindari dulu"
+    if skor >= 70: return LABEL[0]
+    if skor >= 55: return LABEL[1]
+    if skor >= 40: return LABEL[2]
+    return LABEL[3]
 
 # ---------- RENCANA TRANSAKSI ----------
 def bulatkan(h):
@@ -195,7 +197,7 @@ def proses(kode, ihsg):
     stop, target = bulatkan(harga - STOP_ATR * a), bulatkan(harga + TARGET_ATR * a)
     likuid = nilai_harian >= MIN_LIKUID * 1e9
     return {"kode": kode, "df": df, "m": m, "f": f, "tek": tek, "fun": fun, "akhir": akhir,
-            "rekom": label(akhir) if likuid else "⚫ Kurang likuid",
+            "rekom": label(akhir) if likuid else LABEL[4],
             "posisi": int(m["pos"].iloc[-1]), "harga": harga, "stop": stop, "target": target,
             "lot": hitung_lot(harga, stop), "rasio": rasio, "akumulasi": akumulasi,
             "nilai_harian": nilai_harian, "likuid": likuid}
@@ -264,9 +266,10 @@ def blok_detail(d, pertama, ihsg):
     target_pct = (target / harga - 1) * 100
     atribut = data_lot(d)
     grafik = bikin_grafik(d, pertama)
-    return f"""<details id="{d['kode']}">
+    return f"""<details class="blok" id="{d['kode']}">
 <summary><b>{d['kode']}</b> {e(f['nama'])} · {d['rekom']} · skor {d['akhir']:.0f}</summary>
 {grafik}
+<p class="info">Sektor: {e(f['sektor'])}</p>
 <p><b>Rencana transaksi</b> (kalau masuk di harga sekarang)</p>
 <ul>
 <li>Harga {rp(harga)} · Stop loss <b>{rp(stop)}</b> ({stop_pct:+.1f}%) · Target <b>{rp(target)}</b> ({target_pct:+.1f}%)</li>
@@ -295,13 +298,18 @@ h1{font-size:1.5rem;margin-bottom:0} h2{font-size:1.15rem;margin-top:32px;border
 .modal-box label{display:inline-block;margin:4px 16px 4px 0;font-weight:600}
 .modal-box input{font-size:1rem;padding:6px 8px;border:1px solid #999;border-radius:6px;width:150px}
 .modal-box input#risiko{width:60px} #modal-teks{font-weight:700;color:#0b5cad}
+.filter{background:#f3f3f3;border:1px solid #ddd;border-radius:8px;padding:10px;margin:10px 0;display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.filter input[type=text],.filter select,.filter button{font-size:.95rem;padding:6px 8px;border:1px solid #999;border-radius:6px;background:#fff}
+.filter #f-cari{width:190px} .filter #f-skor{width:50px} .filter button{cursor:pointer}
+.filter label{font-size:.9rem} #f-jumlah{width:100%;font-size:.9rem;color:#555}
 .kartu-wrap{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px}
 .kartu{background:#fff;border:1px solid #ddd;border-left:5px solid #2e9e4f;border-radius:8px;padding:12px}
 .kartu .kode{font-size:1.2rem;font-weight:700} .kartu .skor{float:right;color:#2e9e4f;font-weight:700}
 .kartu small{color:#555}
 .geser{overflow-x:auto} table{border-collapse:collapse;width:100%;background:#fff;font-size:.9rem}
 th,td{padding:6px 10px;border-bottom:1px solid #e5e5e5;text-align:right;white-space:nowrap}
-th:first-child,td:first-child,th:nth-child(4),td:nth-child(4){text-align:left} th{background:#f0f0f0}
+th:first-child,td:first-child,th:nth-child(4),td:nth-child(4),th:last-child,td:last-child{text-align:left}
+th{background:#f0f0f0;cursor:pointer;user-select:none}
 details{background:#fff;border:1px solid #ddd;border-radius:8px;padding:10px 14px;margin:8px 0}
 summary{cursor:pointer} a{color:#0b5cad;text-decoration:none} footer{margin-top:32px;color:#777;font-size:.8rem}
 """
@@ -310,9 +318,52 @@ JS = """
 function ukurUlang(){window.dispatchEvent(new Event('resize'));}
 document.querySelectorAll('details').forEach(function(d){d.addEventListener('toggle',ukurUlang);});
 function buka(){var el=document.getElementById(location.hash.slice(1));
-  if(el&&el.tagName==='DETAILS'){el.open=true;el.scrollIntoView();}}
+  if(el&&el.tagName==='DETAILS'){el.style.display='';el.open=true;el.scrollIntoView();}}
 window.addEventListener('hashchange',buka);buka();
 
+// ----- filter -----
+function ambilNilai(id){return document.getElementById(id).value;}
+function saring(){
+  var cari=ambilNilai('f-cari').toUpperCase().split(/[ ,]+/).filter(function(k){return k;});
+  var rekom=ambilNilai('f-rekom'), sinyal=ambilNilai('f-sinyal'), sektor=ambilNilai('f-sektor');
+  var skor=parseFloat(ambilNilai('f-skor'))||0;
+  var lulus=document.getElementById('f-lulus').checked, kebeli=document.getElementById('f-lot').checked;
+  var tampil={}, n=0, semua=0;
+  document.querySelectorAll('tr.baris').forEach(function(tr){
+    semua++;
+    var d=tr.dataset, lot=parseInt(tr.querySelector('[data-harga]').textContent)||0;
+    var ok=(cari.length===0||cari.some(function(k){return d.kode.indexOf(k)>=0;}))
+      &&(!rekom||d.rekom===rekom)&&(!sinyal||d.sinyal===sinyal)&&(!sektor||d.sektor===sektor)
+      &&parseFloat(d.skor)>=skor&&(!lulus||d.lulus==='1')&&(!kebeli||lot>=1);
+    tr.style.display=ok?'':'none'; tampil[d.kode]=ok; if(ok){n++;}
+  });
+  document.querySelectorAll('details.blok').forEach(function(el){el.style.display=tampil[el.id]===false?'none':'';});
+  document.getElementById('f-jumlah').textContent='Menampilkan '+n+' dari '+semua+' saham';
+}
+['f-cari','f-skor'].forEach(function(id){document.getElementById(id).addEventListener('input',saring);});
+['f-rekom','f-sinyal','f-sektor','f-lulus','f-lot'].forEach(function(id){document.getElementById(id).addEventListener('change',saring);});
+document.getElementById('f-reset').addEventListener('click',function(){
+  ['f-cari','f-rekom','f-sinyal','f-sektor'].forEach(function(id){document.getElementById(id).value='';});
+  document.getElementById('f-skor').value='0';
+  document.getElementById('f-lulus').checked=false; document.getElementById('f-lot').checked=false;
+  saring();
+});
+
+// ----- urutkan dengan klik judul kolom -----
+document.querySelectorAll('#tabel-peringkat th').forEach(function(th,i){
+  th.addEventListener('click',function(){
+    var rows=Array.prototype.slice.call(document.querySelectorAll('#tabel-peringkat tr.baris'));
+    var naik=th.dataset.arah!=='naik'; th.dataset.arah=naik?'naik':'turun';
+    function isi(tr){var t=tr.children[i].textContent.trim();
+      var x=parseFloat(t.split('.').join('').replace('x',''));return isNaN(x)?t:x;}
+    rows.sort(function(a,b){var x=isi(a),y=isi(b);
+      if(typeof x==='number'&&typeof y==='number'){return naik?x-y:y-x;}
+      return naik?String(x).localeCompare(String(y)):String(y).localeCompare(String(x));});
+    rows.forEach(function(r){r.parentNode.appendChild(r);});
+  });
+});
+
+// ----- modal dan maks lot -----
 var kotakModal=document.getElementById('modal'), kotakRisiko=document.getElementById('risiko');
 function titik(x){return Math.round(x).toLocaleString('id-ID');}
 function hitung(){
@@ -329,6 +380,7 @@ function hitung(){
         : '<b>0 lot</b>, modal atau batas risikonya terlalu kecil buat saham ini';
     } else { el.textContent=lot; }
   });
+  saring();
 }
 try{
   var m0=localStorage.getItem('modal'), r0=localStorage.getItem('risiko');
@@ -339,6 +391,22 @@ kotakModal.addEventListener('input',hitung);
 kotakRisiko.addEventListener('input',hitung);
 hitung();
 """
+
+def bikin_filter(hasil):
+    pilihan_rekom = "".join(f"<option value='{e(x)}'>{e(x)}</option>" for x in LABEL)
+    sektor = sorted({d["f"]["sektor"] for d in hasil})
+    pilihan_sektor = "".join(f"<option value='{e(x)}'>{e(x)}</option>" for x in sektor)
+    return ("<div class='filter'>"
+            "<input id='f-cari' type='text' placeholder='Cari kode, misal BREN, CUAN'>"
+            f"<select id='f-rekom'><option value=''>Semua rekomendasi</option>{pilihan_rekom}</select>"
+            "<select id='f-sinyal'><option value=''>Semua sinyal</option><option value='Beli'>Beli</option>"
+            "<option value='Jual'>Jual</option></select>"
+            f"<select id='f-sektor'><option value=''>Semua sektor</option>{pilihan_sektor}</select>"
+            "<label>Skor minimal <input id='f-skor' type='text' inputmode='numeric' value='0'></label>"
+            "<label><input type='checkbox' id='f-lulus'> Cuma yang lulus ujian</label>"
+            "<label><input type='checkbox' id='f-lot'> Cuma yang kebeli</label>"
+            "<button id='f-reset' type='button'>Reset</button>"
+            "<div id='f-jumlah'></div></div>")
 
 def bikin_halaman(hasil, perubahan, tgl_pembanding, ihsg, gagal, tanggal_data):
     wib = datetime.now(timezone(timedelta(hours=7)))
@@ -367,7 +435,7 @@ def bikin_halaman(hasil, perubahan, tgl_pembanding, ihsg, gagal, tanggal_data):
 
     # --- Top layak beli ---
     b.append("<h2>Top saham layak beli</h2>")
-    top = [d for d in hasil if d["rekom"].startswith("🟢")][:JUMLAH_TOP]
+    top = [d for d in hasil if d["rekom"] == LABEL[0]][:JUMLAH_TOP]
     if top:
         b.append("<div class='kartu-wrap'>")
         for d in top:
@@ -392,18 +460,27 @@ def bikin_halaman(hasil, perubahan, tgl_pembanding, ihsg, gagal, tanggal_data):
     else:
         b.append(f"<p>Gak ada sinyal yang berubah dibanding data {e(tgl_pembanding)}.</p>")
 
-    # --- Peringkat ---
-    b.append("<h2>Peringkat lengkap</h2><div class='geser'><table><tr><th>Kode</th><th>Harga</th><th>Skor</th>"
-             "<th>Rekomendasi</th><th>Sinyal</th><th>Stop loss</th><th>Target</th><th>Maks lot</th><th>Volume</th></tr>")
+    # --- Peringkat + filter ---
+    b.append("<h2>Peringkat lengkap</h2>")
+    b.append(bikin_filter(hasil))
+    b.append("<p class='info'>Klik judul kolom buat ngurutin.</p>")
+    b.append("<div class='geser'><table id='tabel-peringkat'><tr><th>Kode</th><th>Harga</th><th>Skor</th>"
+             "<th>Rekomendasi</th><th>Sinyal</th><th>Stop loss</th><th>Target</th><th>Maks lot</th>"
+             "<th>Volume</th><th>Sektor</th></tr>")
     for d in hasil:
-        b.append(f"<tr><td><a href='#{d['kode']}'><b>{d['kode']}</b></a></td><td>{angka(d['harga'])}</td>"
-                 f"<td>{d['akhir']:.0f}</td><td>{d['rekom']}</td><td>{'Beli' if d['posisi'] == 1 else 'Jual'}</td>"
+        sinyal = "Beli" if d["posisi"] == 1 else "Jual"
+        lulus = "1" if d["m"]["lulus"] else "0"
+        sektor = e(d["f"]["sektor"])
+        b.append(f"<tr class='baris' data-kode='{d['kode']}' data-skor='{d['akhir']:.0f}' data-rekom='{e(d['rekom'])}' "
+                 f"data-sinyal='{sinyal}' data-lulus='{lulus}' data-sektor='{sektor}'>"
+                 f"<td><a href='#{d['kode']}'><b>{d['kode']}</b></a></td><td>{angka(d['harga'])}</td>"
+                 f"<td>{d['akhir']:.0f}</td><td>{d['rekom']}</td><td>{sinyal}</td>"
                  f"<td>{angka(d['stop'])}</td><td>{angka(d['target'])}</td>"
-                 f"<td {data_lot(d)}>{d['lot']}</td><td>{d['rasio']:.1f}x</td></tr>")
+                 f"<td {data_lot(d)}>{d['lot']}</td><td>{d['rasio']:.1f}x</td><td>{sektor}</td></tr>")
     b.append("</table></div>")
 
     # --- Detail ---
-    b.append("<h2>Detail per saham</h2><p class='info'>Klik buat buka grafik dan penjelasannya.</p>")
+    b.append("<h2>Detail per saham</h2><p class='info'>Klik buat buka grafik dan penjelasannya. Bagian ini ikut filter di atas.</p>")
     for i, d in enumerate(hasil):
         b.append(blok_detail(d, i == 0, ihsg))
 
