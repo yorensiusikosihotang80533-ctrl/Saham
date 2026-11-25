@@ -372,12 +372,12 @@ window.addEventListener('hashchange',buka);buka();
 // ----- TradingView -----
 function muatTV(tombol){
   var wadah=tombol.nextElementSibling;
-  wadah.style.height='480px';
+  wadah.style.height='640px';
   wadah.innerHTML='<div class="tradingview-widget-container" style="height:100%;width:100%"><div class="tradingview-widget-container__widget" style="height:100%;width:100%"></div></div>';
   var s=document.createElement('script');
   s.src='https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js';
   s.async=true;
-  s.innerHTML=JSON.stringify({autosize:true,symbol:'IDX:'+tombol.dataset.kode,interval:'D',timezone:'Asia/Jakarta',theme:'light',style:'1',locale:'id',allow_symbol_change:false});
+    s.innerHTML=JSON.stringify({autosize:true,symbol:'IDX:'+tombol.dataset.kode,interval:'D',timezone:'Asia/Jakarta',theme:'light',style:'1',locale:'id',allow_symbol_change:false,withdateranges:true,hide_side_toolbar:false,studies:['STD;SMA','STD;MACD','STD;RSI']});
   wadah.firstChild.appendChild(s);
   tombol.style.display='none';
 }
